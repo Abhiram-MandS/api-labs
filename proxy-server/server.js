@@ -7,6 +7,7 @@ const url = require('url');
 const net = require('net');
 const tls = require('tls');
 const crypto = require('crypto');
+const { generateAIMockBody } = require('./utils/ai-generate');
 
 const app = express();
 const PORT = process.env.PROXY_PORT || 8888;
@@ -64,6 +65,12 @@ let connectedClients = 0;
 
 // --- Server-side Mock Rules ---
 let mockRules = [];
+let isAIEnabled = false;
+
+function getEffectiveBody(mock) {
+  if (isAIEnabled && mock.aiBody) return mock.aiBody;
+  return mock.body;
+}
 
 function findMockMatch(requestUrl, method) {
   return mockRules.find(m => {
@@ -86,6 +93,14 @@ io.on('connection', (socket) => {
     console.log(`🎭 Mock rules updated (${mockRules.length} rules, ${mockRules.filter(r => r.enabled).length} active)`);
     // Broadcast to all other clients
     socket.broadcast.emit('mock-rules-sync', mockRules);
+  });
+
+  // Receive settings from UI
+  socket.on('settings-update', (settings) => {
+    if (typeof settings.isAIEnabled === 'boolean') {
+      isAIEnabled = settings.isAIEnabled;
+      console.log(`⚙️ Settings updated: AI ${isAIEnabled ? 'enabled' : 'disabled'}`);
+    }
   });
 
   socket.on('disconnect', () => {
@@ -146,13 +161,14 @@ server.on('connect', (req, clientSocket, head) => {
           const duration = Date.now() - startTime;
           
           let mockBody;
+          const effectiveBody = getEffectiveBody(specificMock);
           try {
-            mockBody = JSON.parse(specificMock.body);
+            mockBody = JSON.parse(effectiveBody);
           } catch {
-            mockBody = specificMock.body;
+            mockBody = effectiveBody;
           }
-          
-          const responseBody = typeof specificMock.body === 'string' ? specificMock.body : JSON.stringify(specificMock.body);
+
+          const responseBody = typeof effectiveBody === 'string' ? effectiveBody : JSON.stringify(effectiveBody);
           const httpResponse = [
             `HTTP/1.1 ${specificMock.status} OK`,
             'Content-Type: application/json',
@@ -292,13 +308,14 @@ app.all('/__proxy-mock/*', (req, res) => {
   
   if (mockMatch) {
     const duration = Date.now() - startTime;
+    const effectiveBody = getEffectiveBody(mockMatch);
     let mockBody;
     try {
-      mockBody = JSON.parse(mockMatch.body);
+      mockBody = JSON.parse(effectiveBody);
     } catch {
-      mockBody = mockMatch.body;
+      mockBody = effectiveBody;
     }
-    
+
     const logEntry = {
       id: Math.random().toString(36).substr(2, 9),
       url: `[mock] ${mockPath}`,
@@ -311,15 +328,15 @@ app.all('/__proxy-mock/*', (req, res) => {
       isManaged: true,
       source: 'proxy'
     };
-    
+
     console.log(`🎭 ${req.method} ${mockPath} → Mock ${mockMatch.status} (${duration}ms)`);
     emitLog(logEntry);
-    
+
     res.writeHead(mockMatch.status, {
       'Content-Type': 'application/json',
       'X-Mock-By': 'HTTPIntercept-Proxy'
     });
-    return res.end(typeof mockMatch.body === 'string' ? mockMatch.body : JSON.stringify(mockMatch.body));
+    return res.end(typeof effectiveBody === 'string' ? effectiveBody : JSON.stringify(effectiveBody));
   }
   
   // No mock matched
@@ -331,6 +348,44 @@ app.all('/__proxy-mock/*', (req, res) => {
     availableMocks: mockRules.filter(m => m.enabled).map(m => ({ pattern: m.pattern, method: m.method })),
     hint: 'Create a mock rule in the UI with a pattern that matches this path'
   });
+});
+
+// --- AI Mock Data Generation ---
+app.post('/api/ai/generate', async (req, res) => {
+  const { pattern, method, status, body, model } = req.body;
+
+  // Resolve token: header first, then env var
+  const token = req.headers['x-github-token'] || process.env.GITHUB_TOKEN;
+
+  if (!token) {
+    return res.status(401).json({
+      error: 'No GitHub token configured',
+      hint: 'Set GITHUB_TOKEN environment variable or configure in Settings'
+    });
+  }
+
+  if (!pattern || !body) {
+    return res.status(400).json({ error: 'pattern and body are required' });
+  }
+
+  try {
+    const aiBody = await generateAIMockBody(
+      { pattern, method: method || 'GET', status: status || 200, body, model },
+      token
+    );
+    res.json({ aiBody });
+  } catch (err) {
+    console.error('AI generation error:', err.message);
+
+    if (err.status === 401) {
+      return res.status(401).json({ error: 'Invalid GitHub token' });
+    }
+    if (err.status === 429) {
+      return res.status(429).json({ error: 'Rate limit exceeded. Try again later.' });
+    }
+
+    res.status(500).json({ error: err.message || 'AI generation failed' });
+  }
 });
 
 app.use((req, res) => {
@@ -361,13 +416,14 @@ app.use((req, res) => {
   const mockMatch = findMockMatch(fullUrl, req.method);
   if (mockMatch) {
     const duration = Date.now() - startTime;
+    const effectiveBody = getEffectiveBody(mockMatch);
     let mockBody;
     try {
-      mockBody = JSON.parse(mockMatch.body);
+      mockBody = JSON.parse(effectiveBody);
     } catch {
-      mockBody = mockMatch.body;
+      mockBody = effectiveBody;
     }
-    
+
     const logEntry = {
       id: Math.random().toString(36).substr(2, 9),
       url: fullUrl,
@@ -380,15 +436,15 @@ app.use((req, res) => {
       isManaged: true,
       source: 'proxy'
     };
-    
+
     console.log(`🎭 ${req.method} ${fullUrl} → Mock ${mockMatch.status} (${duration}ms)`);
     emitLog(logEntry);
-    
+
     res.writeHead(mockMatch.status, {
       'Content-Type': 'application/json',
       'X-Mock-By': 'HTTPIntercept-Proxy'
     });
-    return res.end(typeof mockMatch.body === 'string' ? mockMatch.body : JSON.stringify(mockMatch.body));
+    return res.end(typeof effectiveBody === 'string' ? effectiveBody : JSON.stringify(effectiveBody));
   }
 
   const oldWrite = res.write;

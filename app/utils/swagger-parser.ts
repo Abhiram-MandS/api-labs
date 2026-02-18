@@ -12,6 +12,9 @@ export interface MockRule {
   method: string;
   status: number;
   body: string;
+  aiBody?: string;
+  aiStatus?: 'idle' | 'generating' | 'done' | 'error';
+  aiError?: string;
   enabled: boolean;
 }
 

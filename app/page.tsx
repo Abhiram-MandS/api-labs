@@ -29,7 +29,10 @@ import {
   Copy,
   CheckSquare,
   Square,
-  MinusSquare
+  MinusSquare,
+  Moon,
+  Sun,
+  Sparkles
 } from 'lucide-react';
 import io from 'socket.io-client';
 import { parseSwaggerSpec, type SwaggerParseResult } from './utils/swagger-parser';
@@ -80,6 +83,9 @@ interface MockRule {
   method: string;
   status: number;
   body: string;
+  aiBody?: string;
+  aiStatus?: 'idle' | 'generating' | 'done' | 'error';
+  aiError?: string;
   enabled: boolean;
 }
 
@@ -135,6 +141,11 @@ export default function Home() {
   const [swaggerInput, setSwaggerInput] = useState('');
   const [swaggerResult, setSwaggerResult] = useState<SwaggerParseResult | null>(null);
   const [swaggerSelectedIds, setSwaggerSelectedIds] = useState<Set<number>>(new Set());
+  const [isSettingsModalOpen, setIsSettingsModalOpen] = useState(false);
+  const [isDarkMode, setIsDarkMode] = useState(false);
+  const [isAIEnabled, setIsAIEnabled] = useState(false);
+  const [githubPat, setGithubPat] = useState('');
+  const [aiModel, setAiModel] = useState<'gpt-4o-mini' | 'gpt-4o'>('gpt-4o-mini');
   const socketRef = useRef<ReturnType<typeof io> | null>(null);
   const skipNextSync = useRef(false);
   const hydratedRef = useRef(false);
@@ -153,6 +164,10 @@ export default function Home() {
     setMocks(dedup(loadFromStorage('api-labs:mocks', [])));
     setDomains(loadFromStorage('api-labs:domains', ['jsonplaceholder.typicode.com', 'api.github.com']));
     setUrlFilters(dedup(loadFromStorage('api-labs:urlFilters', [])));
+    setIsDarkMode(loadFromStorage('api-labs:darkMode', false));
+    setIsAIEnabled(loadFromStorage('api-labs:aiEnabled', false));
+    setGithubPat(loadFromStorage('api-labs:githubPat', ''));
+    setAiModel(loadFromStorage('api-labs:aiModel', 'gpt-4o-mini'));
     hydratedRef.current = true;
   }, []);
 
@@ -160,6 +175,19 @@ export default function Home() {
   useEffect(() => { if (hydratedRef.current) localStorage.setItem('api-labs:mocks', JSON.stringify(mocks)); }, [mocks]);
   useEffect(() => { if (hydratedRef.current) localStorage.setItem('api-labs:domains', JSON.stringify(domains)); }, [domains]);
   useEffect(() => { if (hydratedRef.current) localStorage.setItem('api-labs:urlFilters', JSON.stringify(urlFilters)); }, [urlFilters]);
+  useEffect(() => { if (hydratedRef.current) localStorage.setItem('api-labs:darkMode', JSON.stringify(isDarkMode)); }, [isDarkMode]);
+  useEffect(() => { if (hydratedRef.current) localStorage.setItem('api-labs:aiEnabled', JSON.stringify(isAIEnabled)); }, [isAIEnabled]);
+  useEffect(() => { if (hydratedRef.current) localStorage.setItem('api-labs:githubPat', JSON.stringify(githubPat)); }, [githubPat]);
+  useEffect(() => { if (hydratedRef.current) localStorage.setItem('api-labs:aiModel', JSON.stringify(aiModel)); }, [aiModel]);
+
+  // --- Dark mode class management ---
+  useEffect(() => {
+    if (isDarkMode) {
+      document.documentElement.classList.add('dark');
+    } else {
+      document.documentElement.classList.remove('dark');
+    }
+  }, [isDarkMode]);
 
   // --- WebSocket connection to proxy server ---
   useEffect(() => {
@@ -212,6 +240,13 @@ export default function Home() {
     }
   }, [mocks]);
 
+  // --- Sync AI settings to proxy server ---
+  useEffect(() => {
+    if (socketRef.current?.connected) {
+      socketRef.current.emit('settings-update', { isAIEnabled });
+    }
+  }, [isAIEnabled]);
+
   // --- Browser fetch interception ---
   useEffect(() => {
     if (typeof window === 'undefined') return;
@@ -241,7 +276,8 @@ export default function Home() {
       if (mockRule) {
         isMocked = true;
         await new Promise(r => setTimeout(r, 300)); // Simulate slight delay
-        response = new Response(mockRule.body, {
+        const effectiveBody = (isAIEnabled && mockRule.aiBody) ? mockRule.aiBody : mockRule.body;
+        response = new Response(effectiveBody, {
           status: mockRule.status,
           headers: { 'Content-Type': 'application/json', 'X-Mock-By': 'HTTPIntercept' }
         });
@@ -296,19 +332,71 @@ export default function Home() {
     return () => {
       window.fetch = originalFetch;
     };
-  }, [mocks, domains]);
+  }, [mocks, domains, isAIEnabled]);
 
   // --- Handlers ---
+  const generateAIBody = useCallback(async (mockId: number, mockData?: MockRule) => {
+    const mock = mockData || mocks.find(m => m.id === mockId);
+    if (!mock) return;
+
+    setMocks(prev => prev.map(m =>
+      m.id === mockId ? { ...m, aiStatus: 'generating' as const, aiError: undefined } : m
+    ));
+
+    try {
+      const response = await originalFetch('http://localhost:8888/api/ai/generate', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(githubPat ? { 'X-GitHub-Token': githubPat } : {}),
+        },
+        body: JSON.stringify({
+          pattern: mock.pattern,
+          method: mock.method,
+          status: mock.status,
+          body: mock.body,
+          model: aiModel,
+        }),
+      });
+
+      if (!response.ok) {
+        const errorData = await response.json();
+        throw new Error(errorData.error || `HTTP ${response.status}`);
+      }
+
+      const data = await response.json();
+
+      setMocks(prev => prev.map(m =>
+        m.id === mockId ? { ...m, aiBody: data.aiBody, aiStatus: 'done' as const, aiError: undefined } : m
+      ));
+    } catch (err) {
+      setMocks(prev => prev.map(m =>
+        m.id === mockId
+          ? { ...m, aiStatus: 'error' as const, aiError: err instanceof Error ? err.message : String(err) }
+          : m
+      ));
+    }
+  }, [mocks, githubPat, aiModel]);
+
   const handleAddMock = () => {
     if (!newMock.pattern) return;
+    let savedMockId: number;
     if (editingMockId !== null) {
-      setMocks(mocks.map(m => m.id === editingMockId ? { ...m, pattern: newMock.pattern, method: newMock.method, status: newMock.status, body: newMock.body } : m));
+      savedMockId = editingMockId;
+      setMocks(mocks.map(m => m.id === editingMockId ? { ...m, pattern: newMock.pattern, method: newMock.method, status: newMock.status, body: newMock.body, aiBody: undefined, aiStatus: 'idle' as const } : m));
       setEditingMockId(null);
     } else {
-      setMocks([...mocks, { ...newMock, id: uniqueId(), enabled: true }]);
+      savedMockId = uniqueId();
+      setMocks([...mocks, { ...newMock, id: savedMockId, enabled: true, aiStatus: 'idle' as const }]);
     }
     setIsMockModalOpen(false);
     setNewMock({ pattern: '', method: 'GET', status: 200, body: '{\n  "status": "success"\n}' });
+
+    // Trigger AI generation if AI is enabled
+    if (isAIEnabled) {
+      const mockData: MockRule = { id: savedMockId, pattern: newMock.pattern, method: newMock.method, status: newMock.status, body: newMock.body, enabled: true };
+      setTimeout(() => generateAIBody(savedMockId, mockData), 100);
+    }
   };
 
   const handleEditMock = (mock: MockRule) => {
@@ -421,7 +509,7 @@ export default function Home() {
 
   const exportAsPostman = () => {
     const toExport = selectedMockIds.size > 0 ? mocks.filter(m => selectedMockIds.has(m.id)) : filteredMocks;
-    const data = mocksToPostmanCollection(toExport);
+    const data = mocksToPostmanCollection(toExport, undefined, isAIEnabled);
     const blob = new Blob([data], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
@@ -490,12 +578,19 @@ export default function Home() {
     if (!swaggerResult || swaggerResult.error) return;
     const selected = swaggerResult.rules.filter(r => swaggerSelectedIds.has(r.id));
     // Re-assign unique IDs to avoid collisions
-    const withIds = selected.map(r => ({ ...r, id: uniqueId() }));
+    const withIds = selected.map(r => ({ ...r, id: uniqueId(), aiStatus: 'idle' as const }));
     setMocks(prev => [...prev, ...withIds]);
     setIsSwaggerModalOpen(false);
     setSwaggerInput('');
     setSwaggerResult(null);
     setSwaggerSelectedIds(new Set());
+
+    // Trigger AI generation for all imported rules if AI is enabled
+    if (isAIEnabled) {
+      setTimeout(() => {
+        withIds.forEach(r => generateAIBody(r.id, r as MockRule));
+      }, 200);
+    }
   };
 
   const toggleSwaggerRule = (id: number) => {
@@ -584,13 +679,13 @@ export default function Home() {
   };
 
   return (
-    <div className="flex h-screen bg-zinc-50 text-zinc-900 font-sans">
+    <div className="flex h-screen bg-zinc-50 dark:bg-zinc-950 text-zinc-900 dark:text-zinc-100 font-sans">
       
       {/* Sidebar */}
-      <aside className="w-72 bg-white border-r border-zinc-200 flex flex-col shrink-0">
-        <div className="h-16 flex items-center px-6 border-b border-zinc-100">
-          <Activity className="w-5 h-5 text-indigo-600 mr-2" />
-          <span className="font-bold tracking-tight text-zinc-800">API Labs</span>
+      <aside className="w-72 bg-white dark:bg-zinc-900 border-r border-zinc-200 dark:border-zinc-800 flex flex-col shrink-0">
+        <div className="h-16 flex items-center px-6 border-b border-zinc-100 dark:border-zinc-800">
+          <Activity className="w-5 h-5 text-indigo-600 dark:text-indigo-400 mr-2" />
+          <span className="font-bold tracking-tight text-zinc-800 dark:text-zinc-100">API Labs</span>
         </div>
 
         <div className="flex-1 overflow-y-auto p-4 space-y-8">
@@ -600,14 +695,14 @@ export default function Home() {
               <h2 className="text-[10px] font-bold text-zinc-400 uppercase tracking-widest flex items-center">
                 <Globe className="w-3 h-3 mr-1" /> Domains
               </h2>
-              <button onClick={() => setIsDomainModalOpen(true)} className="p-1 hover:bg-zinc-100 rounded text-zinc-400">
+              <button onClick={() => setIsDomainModalOpen(true)} className="p-1 hover:bg-zinc-100 dark:hover:bg-zinc-800 rounded text-zinc-400">
                 <Plus className="w-4 h-4" />
               </button>
             </div>
             <div className="space-y-1">
               {domains.map(d => (
-                <div key={d} className="flex items-center justify-between px-3 py-2 text-xs bg-zinc-50 border border-zinc-200 rounded-md group">
-                  <span className="truncate font-medium text-zinc-600">{d}</span>
+                <div key={d} className="flex items-center justify-between px-3 py-2 text-xs bg-zinc-50 dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded-md group">
+                  <span className="truncate font-medium text-zinc-600 dark:text-zinc-300">{d}</span>
                   <button onClick={() => removeDomain(d)} className="opacity-0 group-hover:opacity-100 text-zinc-400 hover:text-red-500">
                     <X className="w-3 h-3" />
                   </button>
@@ -623,7 +718,7 @@ export default function Home() {
                 <Settings className="w-3 h-3 mr-1" /> Mock Rules
               </h2>
               <div className="flex items-center gap-0.5">
-                <button onClick={() => setIsMockModalOpen(true)} className="p-1 hover:bg-zinc-100 rounded text-zinc-400" title="Add rule">
+                <button onClick={() => setIsMockModalOpen(true)} className="p-1 hover:bg-zinc-100 dark:hover:bg-zinc-800 rounded text-zinc-400" title="Add rule">
                   <Plus className="w-4 h-4" />
                 </button>
               </div>
@@ -632,20 +727,20 @@ export default function Home() {
             {/* Summary card */}
             <button
               onClick={() => setIsMockPanelOpen(true)}
-              className="w-full text-left p-3 rounded-lg border border-zinc-200 hover:border-indigo-300 hover:bg-indigo-50/30 transition-all group"
+              className="w-full text-left p-3 rounded-lg border border-zinc-200 dark:border-zinc-700 hover:border-indigo-300 dark:hover:border-indigo-600 hover:bg-indigo-50/30 dark:hover:bg-indigo-950/30 transition-all group"
             >
               <div className="flex items-center justify-between mb-1.5">
-                <span className="text-xs font-semibold text-zinc-700">{mocks.length} rule{mocks.length !== 1 ? 's' : ''}</span>
+                <span className="text-xs font-semibold text-zinc-700 dark:text-zinc-200">{mocks.length} rule{mocks.length !== 1 ? 's' : ''}</span>
                 <ChevronRight className="w-3.5 h-3.5 text-zinc-400 group-hover:text-indigo-500 transition-colors" />
               </div>
               <div className="flex items-center gap-2 text-[10px]">
-                <span className="text-emerald-600 font-medium">{mocks.filter(m => m.enabled).length} active</span>
+                <span className="text-emerald-600 dark:text-emerald-400 font-medium">{mocks.filter(m => m.enabled).length} active</span>
                 {mocks.filter(m => !m.enabled).length > 0 && (
                   <span className="text-zinc-400">{mocks.filter(m => !m.enabled).length} paused</span>
                 )}
               </div>
               {proxyConnected && mocks.length > 0 && (
-                <div className="mt-2 flex items-center gap-1 text-[10px] text-indigo-500">
+                <div className="mt-2 flex items-center gap-1 text-[10px] text-indigo-500 dark:text-indigo-400">
                   <Server className="w-3 h-3" /> Synced
                 </div>
               )}
@@ -659,7 +754,7 @@ export default function Home() {
               <h2 className="text-[10px] font-bold text-zinc-400 uppercase tracking-widest flex items-center">
                 <EyeOff className="w-3 h-3 mr-1" /> URL Filters
               </h2>
-              <button onClick={() => setIsFilterModalOpen(true)} className="p-1 hover:bg-zinc-100 rounded text-zinc-400">
+              <button onClick={() => setIsFilterModalOpen(true)} className="p-1 hover:bg-zinc-100 dark:hover:bg-zinc-800 rounded text-zinc-400">
                 <Plus className="w-4 h-4" />
               </button>
             </div>
@@ -671,7 +766,7 @@ export default function Home() {
                     value={filterSearch}
                     onChange={e => setFilterSearch(e.target.value)}
                     placeholder="Search filters..."
-                    className="w-full pl-7 pr-3 py-1.5 bg-zinc-50 border border-zinc-200 rounded-md text-[11px] outline-none focus:ring-1 focus:ring-indigo-500/30 focus:border-indigo-400"
+                    className="w-full pl-7 pr-3 py-1.5 bg-zinc-50 dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded-md text-[11px] outline-none focus:ring-1 focus:ring-indigo-500/30 focus:border-indigo-400"
                   />
                 </div>
               </div>
@@ -684,14 +779,14 @@ export default function Home() {
                 .filter(f => !filterSearch || f.pattern.toLowerCase().includes(filterSearch.toLowerCase()))
                 .map(f => (
                   <div key={f.id} className={`flex items-center justify-between px-3 py-2 text-xs border rounded-md group transition-all ${
-                    f.enabled ? 'bg-red-50/50 border-red-200/60' : 'bg-zinc-50 border-zinc-200 opacity-50'
+                    f.enabled ? 'bg-red-50/50 dark:bg-red-950/30 border-red-200/60 dark:border-red-800/40' : 'bg-zinc-50 dark:bg-zinc-800 border-zinc-200 dark:border-zinc-700 opacity-50'
                   }`}>
                     <div className="flex items-center gap-1.5 truncate flex-1 min-w-0">
                       {f.isRegex && <span title="Regex"><Regex className="w-3 h-3 text-amber-500 shrink-0" /></span>}
-                      <span className="truncate font-mono text-zinc-600" title={f.pattern}>{f.pattern}</span>
+                      <span className="truncate font-mono text-zinc-600 dark:text-zinc-300" title={f.pattern}>{f.pattern}</span>
                     </div>
                     <div className="flex items-center gap-1 shrink-0 ml-1">
-                      <button onClick={() => toggleUrlFilter(f.id)} className="text-zinc-400 hover:text-zinc-700" title={f.enabled ? 'Disable' : 'Enable'}>
+                      <button onClick={() => toggleUrlFilter(f.id)} className="text-zinc-400 hover:text-zinc-700 dark:hover:text-zinc-200" title={f.enabled ? 'Disable' : 'Enable'}>
                         {f.enabled ? <ToggleRight className="w-3.5 h-3.5 text-red-500" /> : <ToggleLeft className="w-3.5 h-3.5" />}
                       </button>
                       <button onClick={() => removeUrlFilter(f.id)} className="opacity-0 group-hover:opacity-100 text-zinc-400 hover:text-red-500">
@@ -705,7 +800,7 @@ export default function Home() {
           </section>
 
           {/* Proxy Status Section */}
-          <section className="mt-auto pt-4 border-t border-zinc-200">
+          <section className="mt-auto pt-4 border-t border-zinc-200 dark:border-zinc-800">
             <div className="px-2">
               <div className="flex items-center gap-2 text-xs">
                 <Server className="w-3 h-3" />
@@ -713,13 +808,24 @@ export default function Home() {
               </div>
               <div className={`mt-2 px-3 py-2 rounded-md text-xs font-medium ${
                 proxyConnected 
-                  ? 'bg-emerald-50 text-emerald-700 border border-emerald-200' 
-                  : 'bg-zinc-100 text-zinc-500 border border-zinc-200'
+                  ? 'bg-emerald-50 dark:bg-emerald-950/40 text-emerald-700 dark:text-emerald-400 border border-emerald-200 dark:border-emerald-800' 
+                  : 'bg-zinc-100 dark:bg-zinc-800 text-zinc-500 dark:text-zinc-400 border border-zinc-200 dark:border-zinc-700'
               }`}>
                 {proxyConnected ? '✓ Connected' : '○ Disconnected'}
               </div>
             </div>
           </section>
+        </div>
+
+        {/* Settings Button */}
+        <div className="p-4 border-t border-zinc-200 dark:border-zinc-800">
+          <button
+            onClick={() => setIsSettingsModalOpen(true)}
+            className="w-full flex items-center gap-2 px-3 py-2.5 text-xs font-medium text-zinc-500 dark:text-zinc-400 hover:text-zinc-800 dark:hover:text-zinc-100 hover:bg-zinc-100 dark:hover:bg-zinc-800 rounded-lg transition-all"
+          >
+            <Settings className="w-4 h-4" />
+            Settings
+          </button>
         </div>
       </aside>
 
@@ -727,39 +833,39 @@ export default function Home() {
       {isMockPanelOpen && (
         <div className="fixed inset-0 z-40 flex">
           {/* Backdrop */}
-          <div className="absolute inset-0 bg-zinc-900/30 backdrop-blur-sm" onClick={() => setIsMockPanelOpen(false)} />
+          <div className="absolute inset-0 bg-zinc-900/30 dark:bg-black/50 backdrop-blur-sm" onClick={() => setIsMockPanelOpen(false)} />
 
           {/* Panel */}
-          <div className="relative z-10 ml-auto w-full max-w-6xl bg-white shadow-2xl flex flex-col h-full animate-in slide-in-from-right">
+          <div className="relative z-10 ml-auto w-full max-w-6xl bg-white dark:bg-zinc-900 shadow-2xl flex flex-col h-full animate-in slide-in-from-right">
             {/* Header */}
-            <div className="h-16 flex items-center justify-between px-6 border-b border-zinc-200 shrink-0">
+            <div className="h-16 flex items-center justify-between px-6 border-b border-zinc-200 dark:border-zinc-800 shrink-0">
               <div className="flex items-center gap-3">
-                <h2 className="text-lg font-bold text-zinc-800">Mock Rules</h2>
-                <span className="px-2 py-0.5 bg-zinc-100 rounded-full text-[10px] text-zinc-500 font-medium">{mocks.length}</span>
+                <h2 className="text-lg font-bold text-zinc-800 dark:text-zinc-100">Mock Rules</h2>
+                <span className="px-2 py-0.5 bg-zinc-100 dark:bg-zinc-800 rounded-full text-[10px] text-zinc-500 dark:text-zinc-400 font-medium">{mocks.length}</span>
               </div>
               <div className="flex items-center gap-2">
-                <button onClick={() => setIsMockPanelOpen(false)} className="p-1.5 hover:bg-zinc-100 rounded-lg text-zinc-400">
+                <button onClick={() => setIsMockPanelOpen(false)} className="p-1.5 hover:bg-zinc-100 dark:hover:bg-zinc-800 rounded-lg text-zinc-400">
                   <X className="w-5 h-5" />
                 </button>
               </div>
             </div>
 
             {/* Toolbar */}
-            <div className="px-6 py-3 border-b border-zinc-100 flex items-center gap-3 shrink-0 flex-wrap">
+            <div className="px-6 py-3 border-b border-zinc-100 dark:border-zinc-800 flex items-center gap-3 shrink-0 flex-wrap">
               <div className="relative flex-1 min-w-[180px]">
                 <Search className="w-3.5 h-3.5 absolute left-3 top-1/2 -translate-y-1/2 text-zinc-400" />
                 <input
                   value={mockSearch}
                   onChange={e => setMockSearch(e.target.value)}
                   placeholder="Search rules by pattern or method..."
-                  className="w-full pl-9 pr-3 py-2 bg-zinc-50 border border-zinc-200 rounded-lg text-xs outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-400 transition-all"
+                  className="w-full pl-9 pr-3 py-2 bg-zinc-50 dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded-lg text-xs outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-400 transition-all"
                 />
               </div>
               <div className="relative">
                 <select
                   value={mockControllerFilter}
                   onChange={e => setMockControllerFilter(e.target.value)}
-                  className="appearance-none pl-7 pr-8 py-2 bg-zinc-50 border border-zinc-200 rounded-lg text-xs outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-400 transition-all cursor-pointer"
+                  className="appearance-none pl-7 pr-8 py-2 bg-zinc-50 dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded-lg text-xs outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-400 transition-all cursor-pointer"
                 >
                   <option value="all">All Controllers</option>
                   {controllerNames.map(name => (
@@ -773,23 +879,23 @@ export default function Home() {
                 <div className="relative">
                   <button
                     onClick={(e) => { e.stopPropagation(); setExportDropdownOpen(!exportDropdownOpen); }}
-                    className="px-3 py-2 text-xs font-medium text-zinc-600 hover:bg-zinc-100 rounded-lg flex items-center gap-1.5 transition-colors"
+                    className="px-3 py-2 text-xs font-medium text-zinc-600 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800 rounded-lg flex items-center gap-1.5 transition-colors"
                     title="Export"
                   >
                     <Download className="w-3.5 h-3.5" /> Export <ChevronDown className="w-3 h-3" />
                   </button>
                   {exportDropdownOpen && (
-                    <div className="absolute right-0 mt-1 bg-white border border-zinc-200 rounded-xl shadow-xl py-1.5 min-w-[200px] z-50 animate-in fade-in">
+                    <div className="absolute right-0 mt-1 bg-white dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded-xl shadow-xl py-1.5 min-w-[200px] z-50 animate-in fade-in">
                       <button
                         onClick={() => { exportMocks(); setExportDropdownOpen(false); }}
-                        className="w-full px-4 py-2 text-left text-xs hover:bg-zinc-50 flex items-center gap-2 text-zinc-700"
+                        className="w-full px-4 py-2 text-left text-xs hover:bg-zinc-50 dark:hover:bg-zinc-700 flex items-center gap-2 text-zinc-700 dark:text-zinc-200"
                       >
                         <Download className="w-3.5 h-3.5 text-zinc-400" />
                         Export as JSON
                       </button>
                       <button
                         onClick={() => { exportAsPostman(); setExportDropdownOpen(false); }}
-                        className="w-full px-4 py-2 text-left text-xs hover:bg-zinc-50 flex items-center gap-2 text-zinc-700"
+                        className="w-full px-4 py-2 text-left text-xs hover:bg-zinc-50 dark:hover:bg-zinc-700 flex items-center gap-2 text-zinc-700 dark:text-zinc-200"
                       >
                         <FileText className="w-3.5 h-3.5 text-orange-500" />
                         Export as Postman Collection
@@ -797,10 +903,10 @@ export default function Home() {
                     </div>
                   )}
                 </div>
-                <button onClick={importMocks} className="px-3 py-2 text-xs font-medium text-zinc-600 hover:bg-zinc-100 rounded-lg flex items-center gap-1.5 transition-colors" title="Import JSON">
+                <button onClick={importMocks} className="px-3 py-2 text-xs font-medium text-zinc-600 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800 rounded-lg flex items-center gap-1.5 transition-colors" title="Import JSON">
                   <Upload className="w-3.5 h-3.5" /> Import
                 </button>
-                <button onClick={() => { setSwaggerInput(''); setSwaggerResult(null); setSwaggerSelectedIds(new Set()); setIsSwaggerModalOpen(true); }} className="px-3 py-2 text-xs font-medium text-zinc-600 hover:bg-zinc-100 rounded-lg flex items-center gap-1.5 transition-colors" title="Import from Swagger">
+                <button onClick={() => { setSwaggerInput(''); setSwaggerResult(null); setSwaggerSelectedIds(new Set()); setIsSwaggerModalOpen(true); }} className="px-3 py-2 text-xs font-medium text-zinc-600 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800 rounded-lg flex items-center gap-1.5 transition-colors" title="Import from Swagger">
                   <FileText className="w-3.5 h-3.5" /> Swagger
                 </button>
                 <button onClick={() => setIsMockModalOpen(true)} className="px-3 py-2 text-xs font-bold text-white bg-indigo-600 hover:bg-indigo-700 rounded-lg flex items-center gap-1.5 transition-colors shadow-sm">
@@ -811,7 +917,7 @@ export default function Home() {
 
             {/* Bulk actions */}
             {mocks.length > 0 && (
-              <div className="px-6 py-2 border-b border-zinc-100 flex items-center gap-3 text-[11px] shrink-0">
+              <div className="px-6 py-2 border-b border-zinc-100 dark:border-zinc-800 flex items-center gap-3 text-[11px] shrink-0">
                 {selectedMockIds.size > 0 ? (
                   <>
                     <span className="text-indigo-600 font-semibold">{selectedMockIds.size} selected</span>
@@ -835,6 +941,17 @@ export default function Home() {
                     >
                       <Trash2 className="w-3 h-3" /> Delete
                     </button>
+                    {isAIEnabled && (
+                      <>
+                        <div className="h-3 w-px bg-zinc-200" />
+                        <button
+                          onClick={() => mocks.filter(m => selectedMockIds.has(m.id)).forEach(m => generateAIBody(m.id))}
+                          className="text-purple-600 hover:text-purple-800 font-medium flex items-center gap-1"
+                        >
+                          <Sparkles className="w-3 h-3" /> Generate AI
+                        </button>
+                      </>
+                    )}
                     <div className="h-3 w-px bg-zinc-200" />
                     <button
                       onClick={() => setSelectedMockIds(new Set())}
@@ -864,6 +981,17 @@ export default function Home() {
                     >
                       <Trash2 className="w-3 h-3" /> Delete All
                     </button>
+                    {isAIEnabled && (
+                      <>
+                        <div className="h-3 w-px bg-zinc-200" />
+                        <button
+                          onClick={() => filteredMocks.forEach(m => generateAIBody(m.id))}
+                          className="text-purple-600 hover:text-purple-800 font-medium flex items-center gap-1"
+                        >
+                          <Sparkles className="w-3 h-3" /> Generate All AI
+                        </button>
+                      </>
+                    )}
                   </>
                 )}
               </div>
@@ -879,8 +1007,8 @@ export default function Home() {
                 </div>
               ) : (
                 <table className="w-full text-left">
-                  <thead className="sticky top-0 bg-zinc-50/95 backdrop-blur z-10">
-                    <tr className="border-b border-zinc-200">
+                  <thead className="sticky top-0 bg-zinc-50/95 dark:bg-zinc-800/95 backdrop-blur z-10">
+                    <tr className="border-b border-zinc-200 dark:border-zinc-700">
                       <th className="pl-6 pr-1 py-2.5 w-10">
                         <button onClick={toggleSelectAllVisible} title={filteredMocks.length > 0 && filteredMocks.every(m => selectedMockIds.has(m.id)) ? 'Deselect all' : 'Select all'}>
                           {filteredMocks.length > 0 && filteredMocks.every(m => selectedMockIds.has(m.id))
@@ -896,6 +1024,7 @@ export default function Home() {
                       <th className="px-4 py-2.5 text-[10px] font-bold text-zinc-400 uppercase tracking-widest">Pattern</th>
                       <th className="px-4 py-2.5 text-[10px] font-bold text-zinc-400 uppercase tracking-widest w-24 text-center">Controller</th>
                       <th className="px-4 py-2.5 text-[10px] font-bold text-zinc-400 uppercase tracking-widest w-16 text-center">Code</th>
+                      {isAIEnabled && <th className="px-4 py-2.5 text-[10px] font-bold text-zinc-400 uppercase tracking-widest w-14 text-center">AI</th>}
                       <th className="px-4 py-2.5 text-[10px] font-bold text-zinc-400 uppercase tracking-widest w-28 text-right">Actions</th>
                     </tr>
                   </thead>
@@ -908,8 +1037,8 @@ export default function Home() {
                             e.preventDefault();
                             setMockContextMenu({ x: e.clientX, y: e.clientY, mock: m });
                           }}
-                          className={`border-b border-zinc-100 transition-colors group ${
-                            selectedMockIds.has(m.id) ? 'bg-indigo-50/40' : m.enabled ? 'hover:bg-zinc-50' : 'opacity-50 bg-zinc-50/50'
+                          className={`border-b border-zinc-100 dark:border-zinc-800 transition-colors group ${
+                            selectedMockIds.has(m.id) ? 'bg-indigo-50/40 dark:bg-indigo-950/30' : m.enabled ? 'hover:bg-zinc-50 dark:hover:bg-zinc-800/50' : 'opacity-50 bg-zinc-50/50 dark:bg-zinc-800/30'
                           }`}
                         >
                           <td className="pl-6 pr-1 py-3">
@@ -938,23 +1067,50 @@ export default function Home() {
                             }`}>{m.method}</span>
                           </td>
                           <td className="px-4 py-3">
-                            <span className="text-xs font-mono text-zinc-700 truncate block max-w-md" title={m.pattern}>{m.pattern}</span>
+                            <span className="text-xs font-mono text-zinc-700 dark:text-zinc-300 truncate block max-w-md" title={m.pattern}>{m.pattern}</span>
                           </td>
                           <td className="px-4 py-3 text-center">
-                            <span className="text-[10px] font-medium px-2 py-0.5 rounded-full bg-zinc-100 text-zinc-500 capitalize">{getControllerName(m.pattern)}</span>
+                            <span className="text-[10px] font-medium px-2 py-0.5 rounded-full bg-zinc-100 dark:bg-zinc-800 text-zinc-500 dark:text-zinc-400 capitalize">{getControllerName(m.pattern)}</span>
                           </td>
                           <td className="px-4 py-3 text-center">
                             <span className="text-[11px] font-mono text-zinc-500">{m.status}</span>
                           </td>
+                          {isAIEnabled && (
+                            <td className="px-4 py-3 text-center">
+                              {m.aiStatus === 'generating' ? (
+                                <span className="inline-flex items-center" title="Generating AI data...">
+                                  <Sparkles className="w-3.5 h-3.5 text-purple-500 animate-pulse" />
+                                </span>
+                              ) : m.aiStatus === 'done' && m.aiBody ? (
+                                <span className="inline-flex items-center" title="AI data available">
+                                  <Sparkles className="w-3.5 h-3.5 text-purple-600" />
+                                </span>
+                              ) : m.aiStatus === 'error' ? (
+                                <span className="inline-flex items-center" title={m.aiError || 'AI generation failed'}>
+                                  <AlertCircle className="w-3.5 h-3.5 text-red-400" />
+                                </span>
+                              ) : null}
+                            </td>
+                          )}
                           <td className="px-4 py-3 text-right">
                             <div className="flex items-center justify-end gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
-                              <button onClick={() => { handleEditMock(m); }} className="p-1.5 hover:bg-indigo-50 rounded-md text-zinc-400 hover:text-indigo-600" title="Edit">
+                              <button onClick={() => { handleEditMock(m); }} className="p-1.5 hover:bg-indigo-50 dark:hover:bg-indigo-950/50 rounded-md text-zinc-400 hover:text-indigo-600" title="Edit">
                                 <Pencil className="w-3.5 h-3.5" />
                               </button>
-                              <button onClick={() => toggleMock(m.id)} className="p-1.5 hover:bg-zinc-100 rounded-md text-zinc-400 hover:text-zinc-700" title={m.enabled ? 'Disable' : 'Enable'}>
+                              {isAIEnabled && (
+                                <button
+                                  onClick={() => generateAIBody(m.id)}
+                                  className="p-1.5 hover:bg-purple-50 dark:hover:bg-purple-950/50 rounded-md text-zinc-400 hover:text-purple-600"
+                                  title={m.aiStatus === 'generating' ? 'Generating...' : 'Regenerate AI data'}
+                                  disabled={m.aiStatus === 'generating'}
+                                >
+                                  <Sparkles className={`w-3.5 h-3.5 ${m.aiStatus === 'generating' ? 'animate-pulse' : ''}`} />
+                                </button>
+                              )}
+                              <button onClick={() => toggleMock(m.id)} className="p-1.5 hover:bg-zinc-100 dark:hover:bg-zinc-800 rounded-md text-zinc-400 hover:text-zinc-700 dark:hover:text-zinc-200" title={m.enabled ? 'Disable' : 'Enable'}>
                                 {m.enabled ? <PowerOff className="w-3.5 h-3.5" /> : <Power className="w-3.5 h-3.5" />}
                               </button>
-                              <button onClick={() => deleteMock(m.id)} className="p-1.5 hover:bg-red-50 rounded-md text-zinc-400 hover:text-red-600" title="Delete">
+                              <button onClick={() => deleteMock(m.id)} className="p-1.5 hover:bg-red-50 dark:hover:bg-red-950/50 rounded-md text-zinc-400 hover:text-red-600" title="Delete">
                                 <Trash2 className="w-3.5 h-3.5" />
                               </button>
                             </div>
@@ -968,7 +1124,7 @@ export default function Home() {
 
             {/* Footer */}
             {proxyConnected && mocks.length > 0 && (
-              <div className="px-6 py-2.5 border-t border-zinc-200 bg-indigo-50/50 text-[11px] text-indigo-600 flex items-center gap-1.5 shrink-0">
+              <div className="px-6 py-2.5 border-t border-zinc-200 dark:border-zinc-800 bg-indigo-50/50 dark:bg-indigo-950/30 text-[11px] text-indigo-600 dark:text-indigo-400 flex items-center gap-1.5 shrink-0">
                 <Server className="w-3.5 h-3.5" /> All rules synced to proxy server
               </div>
             )}
@@ -977,7 +1133,7 @@ export default function Home() {
           {/* Mock Context Menu */}
           {mockContextMenu && (
             <div
-              className="fixed z-[70] bg-white border border-zinc-200 rounded-xl shadow-xl py-1.5 min-w-[180px] animate-in fade-in"
+              className="fixed z-[70] bg-white dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded-xl shadow-xl py-1.5 min-w-[180px] animate-in fade-in"
               style={{ left: mockContextMenu.x, top: mockContextMenu.y }}
               onClick={e => e.stopPropagation()}
             >
@@ -986,7 +1142,7 @@ export default function Home() {
                   handleEditMock(mockContextMenu.mock);
                   setMockContextMenu(null);
                 }}
-                className="w-full px-4 py-2 text-left text-xs hover:bg-zinc-50 flex items-center gap-2 text-zinc-700"
+                className="w-full px-4 py-2 text-left text-xs hover:bg-zinc-50 dark:hover:bg-zinc-700 flex items-center gap-2 text-zinc-700 dark:text-zinc-200"
               >
                 <Pencil className="w-3.5 h-3.5 text-zinc-400" />
                 Edit Rule
@@ -996,7 +1152,7 @@ export default function Home() {
                   toggleMock(mockContextMenu.mock.id);
                   setMockContextMenu(null);
                 }}
-                className="w-full px-4 py-2 text-left text-xs hover:bg-zinc-50 flex items-center gap-2 text-zinc-700"
+                className="w-full px-4 py-2 text-left text-xs hover:bg-zinc-50 dark:hover:bg-zinc-700 flex items-center gap-2 text-zinc-700 dark:text-zinc-200"
               >
                 {mockContextMenu.mock.enabled
                   ? <><PowerOff className="w-3.5 h-3.5 text-zinc-400" /> Disable</>
@@ -1009,18 +1165,30 @@ export default function Home() {
                   setMocks(prev => [...prev, dup]);
                   setMockContextMenu(null);
                 }}
-                className="w-full px-4 py-2 text-left text-xs hover:bg-zinc-50 flex items-center gap-2 text-zinc-700"
+                className="w-full px-4 py-2 text-left text-xs hover:bg-zinc-50 dark:hover:bg-zinc-700 flex items-center gap-2 text-zinc-700 dark:text-zinc-200"
               >
                 <Copy className="w-3.5 h-3.5 text-zinc-400" />
                 Duplicate
               </button>
-              <div className="border-t border-zinc-100 my-1" />
+              {isAIEnabled && (
+                <button
+                  onClick={() => {
+                    generateAIBody(mockContextMenu.mock.id);
+                    setMockContextMenu(null);
+                  }}
+                  className="w-full px-4 py-2 text-left text-xs hover:bg-zinc-50 dark:hover:bg-zinc-700 flex items-center gap-2 text-zinc-700 dark:text-zinc-200"
+                >
+                  <Sparkles className="w-3.5 h-3.5 text-purple-500" />
+                  Regenerate AI Data
+                </button>
+              )}
+              <div className="border-t border-zinc-100 dark:border-zinc-700 my-1" />
               <button
                 onClick={() => {
                   deleteMock(mockContextMenu.mock.id);
                   setMockContextMenu(null);
                 }}
-                className="w-full px-4 py-2 text-left text-xs hover:bg-red-50 flex items-center gap-2 text-red-600"
+                className="w-full px-4 py-2 text-left text-xs hover:bg-red-50 dark:hover:bg-red-950/50 flex items-center gap-2 text-red-600"
               >
                 <Trash2 className="w-3.5 h-3.5" />
                 Delete
@@ -1031,23 +1199,23 @@ export default function Home() {
       )}
 
       {/* Main Content */}
-      <main className="flex-1 flex flex-col bg-white overflow-hidden">
-        <header className="h-16 border-b border-zinc-200 flex items-center justify-between px-8 bg-white/80 backdrop-blur-md">
-          <div className="flex items-center text-sm font-medium text-zinc-500">
+      <main className="flex-1 flex flex-col bg-white dark:bg-zinc-950 overflow-hidden">
+        <header className="h-16 border-b border-zinc-200 dark:border-zinc-800 flex items-center justify-between px-8 bg-white/80 dark:bg-zinc-950/80 backdrop-blur-md">
+          <div className="flex items-center text-sm font-medium text-zinc-500 dark:text-zinc-400">
             Network Activity
-            <span className="ml-2 px-2 py-0.5 bg-zinc-100 rounded-full text-[10px] text-zinc-400">{filteredLogs.length}</span>
+            <span className="ml-2 px-2 py-0.5 bg-zinc-100 dark:bg-zinc-800 rounded-full text-[10px] text-zinc-400">{filteredLogs.length}</span>
             {filteredLogs.length < logs.length && (
-              <span className="ml-1 px-2 py-0.5 bg-red-50 rounded-full text-[10px] text-red-400">
+              <span className="ml-1 px-2 py-0.5 bg-red-50 dark:bg-red-950/40 rounded-full text-[10px] text-red-400">
                 {logs.length - filteredLogs.length} hidden
               </span>
             )}
           </div>
           <div className="flex items-center gap-3">
-            <button onClick={() => setLogs([])} className="text-xs text-zinc-400 hover:text-zinc-900 transition-colors">Clear</button>
-            <div className="h-4 w-[1px] bg-zinc-200"></div>
+            <button onClick={() => setLogs([])} className="text-xs text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-100 transition-colors">Clear</button>
+            <div className="h-4 w-[1px] bg-zinc-200 dark:bg-zinc-700"></div>
             <button 
               onClick={testFetch}
-              className="px-4 py-2 bg-zinc-900 text-white text-xs font-semibold rounded-lg hover:bg-zinc-800 transition-all shadow-sm shadow-zinc-200"
+              className="px-4 py-2 bg-zinc-900 dark:bg-zinc-100 text-white dark:text-zinc-900 text-xs font-semibold rounded-lg hover:bg-zinc-800 dark:hover:bg-zinc-200 transition-all shadow-sm shadow-zinc-200 dark:shadow-zinc-800"
             >
               Test Random Request
             </button>
@@ -1058,8 +1226,8 @@ export default function Home() {
           {/* Table */}
           <div className="flex-1 overflow-y-auto">
             <table className="w-full text-left border-collapse">
-              <thead className="sticky top-0 bg-zinc-50/90 backdrop-blur z-10">
-                <tr className="border-b border-zinc-200">
+              <thead className="sticky top-0 bg-zinc-50/90 dark:bg-zinc-900/90 backdrop-blur z-10">
+                <tr className="border-b border-zinc-200 dark:border-zinc-700">
                   <th className="px-6 py-3 text-[10px] font-bold text-zinc-400 uppercase tracking-widest w-20">Source</th>
                   <th className="px-6 py-3 text-[10px] font-bold text-zinc-400 uppercase tracking-widest w-24">Method</th>
                   <th className="px-6 py-3 text-[10px] font-bold text-zinc-400 uppercase tracking-widest">Endpoint</th>
@@ -1081,7 +1249,7 @@ export default function Home() {
                     key={log.id} 
                     onClick={() => setSelectedLogId(log.id)}
                     onContextMenu={(e) => handleRowContextMenu(e, log)}
-                    className={`border-b border-zinc-100 hover:bg-zinc-50 cursor-pointer transition-colors group ${selectedLogId === log.id ? 'bg-indigo-50/50' : ''}`}
+                    className={`border-b border-zinc-100 dark:border-zinc-800 hover:bg-zinc-50 dark:hover:bg-zinc-800/50 cursor-pointer transition-colors group ${selectedLogId === log.id ? 'bg-indigo-50/50 dark:bg-indigo-950/30' : ''}`}
                   >
                     <td className="px-6 py-4">
                       {log.source === 'proxy' ? (
@@ -1096,13 +1264,13 @@ export default function Home() {
                     <td className="px-6 py-4">
                       <div className="flex items-center">
                         {log.isManaged && <Globe className="w-3 h-3 text-indigo-500 mr-2 shrink-0" />}
-                        <span className="text-xs font-mono text-zinc-600 truncate max-w-md">{log.url}</span>
+                      <span className="text-xs font-mono text-zinc-600 dark:text-zinc-300 truncate max-w-md">{log.url}</span>
                       </div>
                     </td>
                     <td className="px-6 py-4 text-center">
                       <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${
-                        log.status === 'FAIL' ? 'bg-red-50 text-red-600' : 
-                        typeof log.status === 'number' && log.status >= 400 ? 'bg-orange-50 text-orange-600' : 'bg-emerald-50 text-emerald-600'
+                        log.status === 'FAIL' ? 'bg-red-50 dark:bg-red-950/40 text-red-600 dark:text-red-400' : 
+                        typeof log.status === 'number' && log.status >= 400 ? 'bg-orange-50 dark:bg-orange-950/40 text-orange-600 dark:text-orange-400' : 'bg-emerald-50 dark:bg-emerald-950/40 text-emerald-600 dark:text-emerald-400'
                       }`}>
                         {log.status}
                       </span>
@@ -1123,17 +1291,17 @@ export default function Home() {
 
           {/* Inspector Panel */}
           {selectedLog && (
-            <div className="w-[450px] border-l border-zinc-200 bg-white flex flex-col shrink-0">
-              <div className="h-16 flex items-center justify-between px-6 border-b border-zinc-200">
-                <h3 className="text-sm font-bold text-zinc-800">Inspector</h3>
-                <button onClick={() => setSelectedLogId(null)} className="p-1 hover:bg-zinc-100 rounded">
+            <div className="w-[450px] border-l border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 flex flex-col shrink-0">
+              <div className="h-16 flex items-center justify-between px-6 border-b border-zinc-200 dark:border-zinc-800">
+                <h3 className="text-sm font-bold text-zinc-800 dark:text-zinc-100">Inspector</h3>
+                <button onClick={() => setSelectedLogId(null)} className="p-1 hover:bg-zinc-100 dark:hover:bg-zinc-800 rounded">
                   <X className="w-4 h-4 text-zinc-400" />
                 </button>
               </div>
               <div className="flex-1 overflow-y-auto p-6 space-y-8">
                 <div>
                   <label className="text-[10px] font-bold text-zinc-400 uppercase tracking-widest block mb-2">Request Details</label>
-                  <div className="p-3 bg-zinc-50 rounded-lg border border-zinc-100 text-[11px] font-mono break-all leading-relaxed text-zinc-600">
+                  <div className="p-3 bg-zinc-50 dark:bg-zinc-800 rounded-lg border border-zinc-100 dark:border-zinc-700 text-[11px] font-mono break-all leading-relaxed text-zinc-600 dark:text-zinc-300">
                     <p><span className="text-zinc-400">URL:</span> {selectedLog.url}</p>
                     <p><span className="text-zinc-400">Method:</span> {selectedLog.method}</p>
                     <p><span className="text-zinc-400">Time:</span> {selectedLog.timestamp}</p>
@@ -1156,12 +1324,12 @@ export default function Home() {
                 </div>
 
                 {selectedLog.type === 'Mock' && (
-                  <div className="p-4 bg-indigo-50 border border-indigo-100 rounded-lg">
-                    <div className="flex items-center text-indigo-700 text-xs font-bold mb-1">
+                  <div className="p-4 bg-indigo-50 dark:bg-indigo-950/40 border border-indigo-100 dark:border-indigo-800 rounded-lg">
+                    <div className="flex items-center text-indigo-700 dark:text-indigo-300 text-xs font-bold mb-1">
                       <CheckCircle2 className="w-4 h-4 mr-2" />
                       Mock Intercepted
                     </div>
-                    <p className="text-[11px] text-indigo-600 leading-relaxed">
+                    <p className="text-[11px] text-indigo-600 dark:text-indigo-400 leading-relaxed">
                       This request was intercepted by a local mock rule. No actual network call was made.
                     </p>
                   </div>
@@ -1175,7 +1343,7 @@ export default function Home() {
       {/* Context Menu */}
       {contextMenu && (
         <div
-          className="fixed z-[60] bg-white border border-zinc-200 rounded-xl shadow-xl py-1.5 min-w-[200px] animate-in fade-in"
+          className="fixed z-[60] bg-white dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded-xl shadow-xl py-1.5 min-w-[200px] animate-in fade-in"
           style={{ left: contextMenu.x, top: contextMenu.y }}
           onClick={e => e.stopPropagation()}
         >
@@ -1184,7 +1352,7 @@ export default function Home() {
               addUrlFilter(contextMenu.url);
               setContextMenu(null);
             }}
-            className="w-full px-4 py-2 text-left text-xs hover:bg-zinc-50 flex items-center gap-2 text-zinc-700"
+            className="w-full px-4 py-2 text-left text-xs hover:bg-zinc-50 dark:hover:bg-zinc-700 flex items-center gap-2 text-zinc-700 dark:text-zinc-200"
           >
             <EyeOff className="w-3.5 h-3.5 text-zinc-400" />
             Hide this exact URL
@@ -1200,12 +1368,12 @@ export default function Home() {
               }
               setContextMenu(null);
             }}
-            className="w-full px-4 py-2 text-left text-xs hover:bg-zinc-50 flex items-center gap-2 text-zinc-700"
+            className="w-full px-4 py-2 text-left text-xs hover:bg-zinc-50 dark:hover:bg-zinc-700 flex items-center gap-2 text-zinc-700 dark:text-zinc-200"
           >
             <Filter className="w-3.5 h-3.5 text-zinc-400" />
             Hide by path pattern
           </button>
-          <div className="border-t border-zinc-100 my-1" />
+          <div className="border-t border-zinc-100 dark:border-zinc-700 my-1" />
           <button
             onClick={() => {
               // Pre-fill mock with URL path and method from the log entry
@@ -1228,7 +1396,7 @@ export default function Home() {
               setIsMockModalOpen(true);
               setContextMenu(null);
             }}
-            className="w-full px-4 py-2 text-left text-xs hover:bg-zinc-50 flex items-center gap-2 text-zinc-700"
+            className="w-full px-4 py-2 text-left text-xs hover:bg-zinc-50 dark:hover:bg-zinc-700 flex items-center gap-2 text-zinc-700 dark:text-zinc-200"
           >
             <Settings className="w-3.5 h-3.5 text-indigo-500" />
             Create mock for this URL
@@ -1250,12 +1418,12 @@ export default function Home() {
               setIsMockModalOpen(true);
               setContextMenu(null);
             }}
-            className="w-full px-4 py-2 text-left text-xs hover:bg-zinc-50 flex items-center gap-2 text-zinc-700"
+            className="w-full px-4 py-2 text-left text-xs hover:bg-zinc-50 dark:hover:bg-zinc-700 flex items-center gap-2 text-zinc-700 dark:text-zinc-200"
           >
             <Settings className="w-3.5 h-3.5 text-purple-500" />
             Create mock for this host
           </button>
-          <div className="border-t border-zinc-100 my-1" />
+          <div className="border-t border-zinc-100 dark:border-zinc-700 my-1" />
           <button
             onClick={() => {
               try {
@@ -1267,7 +1435,7 @@ export default function Home() {
               } catch { /* ignore */ }
               setContextMenu(null);
             }}
-            className="w-full px-4 py-2 text-left text-xs hover:bg-zinc-50 flex items-center gap-2 text-zinc-700"
+            className="w-full px-4 py-2 text-left text-xs hover:bg-zinc-50 dark:hover:bg-zinc-700 flex items-center gap-2 text-zinc-700 dark:text-zinc-200"
           >
             <Regex className="w-3.5 h-3.5 text-amber-500" />
             Hide by file extension (regex)
@@ -1277,8 +1445,8 @@ export default function Home() {
 
       {/* URL Filter Modal */}
       {isFilterModalOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-zinc-900/40 backdrop-blur-sm px-4">
-          <div className="bg-white w-full max-w-sm rounded-2xl shadow-2xl border border-zinc-200 p-6 overflow-hidden">
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-zinc-900/40 dark:bg-black/60 backdrop-blur-sm px-4">
+          <div className="bg-white dark:bg-zinc-900 w-full max-w-sm rounded-2xl shadow-2xl border border-zinc-200 dark:border-zinc-700 p-6 overflow-hidden">
             <h3 className="text-lg font-bold mb-1">Add URL Filter</h3>
             <p className="text-zinc-500 text-xs mb-6">Requests matching this pattern will be hidden from the network log.</p>
             
@@ -1314,8 +1482,8 @@ export default function Home() {
             </div>
 
             <div className="mt-8 flex justify-end gap-2">
-              <button onClick={() => { setIsFilterModalOpen(false); setNewFilter({ pattern: '', isRegex: false }); }} className="px-4 py-2 text-xs font-semibold text-zinc-500 hover:text-zinc-800">Cancel</button>
-              <button onClick={handleAddFilter} className="px-6 py-2 bg-red-600 text-white text-xs font-bold rounded-lg hover:bg-red-700 shadow-lg shadow-red-100">Add Filter</button>
+              <button onClick={() => { setIsFilterModalOpen(false); setNewFilter({ pattern: '', isRegex: false }); }} className="px-4 py-2 text-xs font-semibold text-zinc-500 hover:text-zinc-800 dark:hover:text-zinc-200">Cancel</button>
+              <button onClick={handleAddFilter} className="px-6 py-2 bg-red-600 text-white text-xs font-bold rounded-lg hover:bg-red-700 shadow-lg shadow-red-100 dark:shadow-red-900/20">Add Filter</button>
             </div>
           </div>
         </div>
@@ -1323,10 +1491,10 @@ export default function Home() {
 
       {/* Domain Modal */}
       {isDomainModalOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-zinc-900/40 backdrop-blur-sm px-4">
-          <div className="bg-white w-full max-w-sm rounded-2xl shadow-2xl border border-zinc-200 p-6 overflow-hidden">
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-zinc-900/40 dark:bg-black/60 backdrop-blur-sm px-4">
+          <div className="bg-white dark:bg-zinc-900 w-full max-w-sm rounded-2xl shadow-2xl border border-zinc-200 dark:border-zinc-700 p-6 overflow-hidden">
             <h3 className="text-lg font-bold mb-1">Add Domain</h3>
-            <p className="text-zinc-500 text-xs mb-6">Specify base URLs to flag in the network log.</p>
+            <p className="text-zinc-500 dark:text-zinc-400 text-xs mb-6">Specify base URLs to flag in the network log.</p>
             
             <div className="space-y-4">
               <div>
@@ -1337,14 +1505,14 @@ export default function Home() {
                   onChange={e => setNewDomain(e.target.value)}
                   onKeyPress={e => e.key === 'Enter' && handleAddDomain()}
                   placeholder="e.g. api.stripe.com" 
-                  className="w-full px-3 py-2 bg-zinc-50 border border-zinc-200 rounded-lg text-sm outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 transition-all"
+                  className="w-full px-3 py-2 bg-zinc-50 dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded-lg text-sm outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 transition-all"
                 />
               </div>
             </div>
 
             <div className="mt-8 flex justify-end gap-2">
-              <button onClick={() => setIsDomainModalOpen(false)} className="px-4 py-2 text-xs font-semibold text-zinc-500 hover:text-zinc-800">Cancel</button>
-              <button onClick={handleAddDomain} className="px-6 py-2 bg-indigo-600 text-white text-xs font-bold rounded-lg hover:bg-indigo-700 shadow-lg shadow-indigo-100">Add Tracked Domain</button>
+              <button onClick={() => setIsDomainModalOpen(false)} className="px-4 py-2 text-xs font-semibold text-zinc-500 hover:text-zinc-800 dark:hover:text-zinc-200">Cancel</button>
+              <button onClick={handleAddDomain} className="px-6 py-2 bg-indigo-600 text-white text-xs font-bold rounded-lg hover:bg-indigo-700 shadow-lg shadow-indigo-100 dark:shadow-indigo-900/20">Add Tracked Domain</button>
             </div>
           </div>
         </div>
@@ -1352,10 +1520,10 @@ export default function Home() {
 
       {/* Mock Modal */}
       {isMockModalOpen && (
-        <div className="fixed inset-0 z-[60] flex items-center justify-center bg-zinc-900/40 backdrop-blur-sm px-4">
-          <div className="bg-white w-full max-w-lg rounded-2xl shadow-2xl border border-zinc-200 p-8 overflow-hidden">
+        <div className="fixed inset-0 z-[60] flex items-center justify-center bg-zinc-900/40 dark:bg-black/60 backdrop-blur-sm px-4">
+          <div className="bg-white dark:bg-zinc-900 w-full max-w-lg rounded-2xl shadow-2xl border border-zinc-200 dark:border-zinc-700 p-8 overflow-hidden">
             <h3 className="text-xl font-bold mb-1">{editingMockId !== null ? 'Edit Mock Rule' : 'Create Mock Rule'}</h3>
-            <p className="text-zinc-500 text-sm mb-8">{editingMockId !== null ? 'Update the mock rule configuration below.' : 'Requests matching this pattern will return the body defined below.'}</p>
+            <p className="text-zinc-500 dark:text-zinc-400 text-sm mb-8">{editingMockId !== null ? 'Update the mock rule configuration below.' : 'Requests matching this pattern will return the body defined below.'}</p>
             
             <div className="space-y-5">
               <div>
@@ -1365,7 +1533,7 @@ export default function Home() {
                   value={newMock.pattern}
                   onChange={e => setNewMock({...newMock, pattern: e.target.value})}
                   placeholder="/api/v1/users/profile" 
-                  className="w-full px-4 py-2.5 bg-zinc-50 border border-zinc-200 rounded-xl text-sm outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 transition-all font-mono"
+                  className="w-full px-4 py-2.5 bg-zinc-50 dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded-xl text-sm outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 transition-all font-mono"
                 />
               </div>
 
@@ -1375,7 +1543,7 @@ export default function Home() {
                   <select 
                     value={newMock.method}
                     onChange={e => setNewMock({...newMock, method: e.target.value})}
-                    className="w-full px-4 py-2.5 bg-zinc-50 border border-zinc-200 rounded-xl text-sm outline-none"
+                    className="w-full px-4 py-2.5 bg-zinc-50 dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded-xl text-sm outline-none"
                   >
                     <option>GET</option><option>POST</option><option>PUT</option><option>DELETE</option>
                   </select>
@@ -1386,7 +1554,7 @@ export default function Home() {
                     type="number" 
                     value={newMock.status}
                     onChange={e => setNewMock({...newMock, status: parseInt(e.target.value)})}
-                    className="w-full px-4 py-2.5 bg-zinc-50 border border-zinc-200 rounded-xl text-sm outline-none"
+                    className="w-full px-4 py-2.5 bg-zinc-50 dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded-xl text-sm outline-none"
                   />
                 </div>
               </div>
@@ -1403,27 +1571,27 @@ export default function Home() {
             </div>
 
             <div className="mt-10 flex justify-end gap-3">
-              <button onClick={() => { setIsMockModalOpen(false); setEditingMockId(null); setNewMock({ pattern: '', method: 'GET', status: 200, body: '{\n  "status": "success"\n}' }); }} className="px-5 py-2.5 text-sm font-semibold text-zinc-500 hover:text-zinc-800">Cancel</button>
-              <button onClick={handleAddMock} className="px-8 py-2.5 bg-indigo-600 text-white text-sm font-bold rounded-xl hover:bg-indigo-700 shadow-xl shadow-indigo-100 transition-all">{editingMockId !== null ? 'Save Changes' : 'Create Rule'}</button>
+              <button onClick={() => { setIsMockModalOpen(false); setEditingMockId(null); setNewMock({ pattern: '', method: 'GET', status: 200, body: '{\n  "status": "success"\n}' }); }} className="px-5 py-2.5 text-sm font-semibold text-zinc-500 hover:text-zinc-800 dark:hover:text-zinc-200">Cancel</button>
+              <button onClick={handleAddMock} className="px-8 py-2.5 bg-indigo-600 text-white text-sm font-bold rounded-xl hover:bg-indigo-700 shadow-xl shadow-indigo-100 dark:shadow-indigo-900/20 transition-all">{editingMockId !== null ? 'Save Changes' : 'Create Rule'}</button>
             </div>
           </div>
         </div>
       )}
       {/* Swagger Import Modal */}
       {isSwaggerModalOpen && (
-        <div className="fixed inset-0 z-[60] flex items-center justify-center bg-zinc-900/40 backdrop-blur-sm px-4">
-          <div className="bg-white w-full max-w-2xl rounded-2xl shadow-2xl border border-zinc-200 p-8 max-h-[90vh] flex flex-col">
+        <div className="fixed inset-0 z-[60] flex items-center justify-center bg-zinc-900/40 dark:bg-black/60 backdrop-blur-sm px-4">
+          <div className="bg-white dark:bg-zinc-900 w-full max-w-2xl rounded-2xl shadow-2xl border border-zinc-200 dark:border-zinc-700 p-8 max-h-[90vh] flex flex-col">
             <div className="flex items-center justify-between mb-1">
               <h3 className="text-xl font-bold">Import from Swagger / OpenAPI</h3>
-              <button onClick={() => setIsSwaggerModalOpen(false)} className="p-1 hover:bg-zinc-100 rounded text-zinc-400">
+              <button onClick={() => setIsSwaggerModalOpen(false)} className="p-1 hover:bg-zinc-100 dark:hover:bg-zinc-800 rounded text-zinc-400">
                 <X className="w-5 h-5" />
               </button>
             </div>
-            <p className="text-zinc-500 text-sm mb-6">Paste a Swagger 2.0 or OpenAPI 3.x spec (JSON or YAML), or upload a file. Mock rules will be generated from the response schemas.</p>
+            <p className="text-zinc-500 dark:text-zinc-400 text-sm mb-6">Paste a Swagger 2.0 or OpenAPI 3.x spec (JSON or YAML), or upload a file. Mock rules will be generated from the response schemas.</p>
 
             {/* File upload */}
             <div className="mb-4">
-              <label className="inline-flex items-center gap-2 px-4 py-2 border border-zinc-200 rounded-lg text-sm font-medium text-zinc-600 hover:bg-zinc-50 cursor-pointer transition-colors">
+              <label className="inline-flex items-center gap-2 px-4 py-2 border border-zinc-200 dark:border-zinc-700 rounded-lg text-sm font-medium text-zinc-600 dark:text-zinc-300 hover:bg-zinc-50 dark:hover:bg-zinc-800 cursor-pointer transition-colors">
                 <FileUp className="w-4 h-4" />
                 Upload spec file
                 <input type="file" accept=".json,.yaml,.yml" className="hidden" onChange={handleSwaggerFileUpload} />
@@ -1444,7 +1612,7 @@ export default function Home() {
               <button
                 onClick={handleSwaggerParse}
                 disabled={!swaggerInput.trim()}
-                className="self-start px-6 py-2 bg-indigo-600 text-white text-sm font-bold rounded-lg hover:bg-indigo-700 shadow-lg shadow-indigo-100 transition-all disabled:opacity-40 disabled:cursor-not-allowed mb-4"
+                className="self-start px-6 py-2 bg-indigo-600 text-white text-sm font-bold rounded-lg hover:bg-indigo-700 shadow-lg shadow-indigo-100 dark:shadow-indigo-900/20 transition-all disabled:opacity-40 disabled:cursor-not-allowed mb-4"
               >
                 Parse Spec
               </button>
@@ -1452,7 +1620,7 @@ export default function Home() {
 
             {/* Error */}
             {swaggerResult?.error && (
-              <div className="flex items-start gap-2 p-3 bg-red-50 border border-red-200 rounded-lg text-sm text-red-700 mb-4">
+              <div className="flex items-start gap-2 p-3 bg-red-50 dark:bg-red-950/40 border border-red-200 dark:border-red-800 rounded-lg text-sm text-red-700 dark:text-red-400 mb-4">
                 <AlertCircle className="w-4 h-4 mt-0.5 flex-shrink-0" />
                 {swaggerResult.error}
               </div>
@@ -1462,12 +1630,12 @@ export default function Home() {
             {swaggerResult && !swaggerResult.error && (
               <div className="flex-1 overflow-hidden flex flex-col">
                 <div className="flex items-center justify-between mb-3">
-                  <div className="text-sm text-zinc-600">
+                  <div className="text-sm text-zinc-600 dark:text-zinc-300">
                     <span className="font-bold">{swaggerResult.title}</span>
                     {swaggerResult.version && <span className="text-zinc-400 ml-2">v{swaggerResult.version}</span>}
                     <span className="text-zinc-400 ml-2">&middot; {swaggerResult.rules.length} endpoint{swaggerResult.rules.length !== 1 ? 's' : ''}</span>
                   </div>
-                  <button onClick={toggleAllSwaggerRules} className="text-xs font-semibold text-indigo-600 hover:text-indigo-800">
+                  <button onClick={toggleAllSwaggerRules} className="text-xs font-semibold text-indigo-600 dark:text-indigo-400 hover:text-indigo-800 dark:hover:text-indigo-300">
                     {swaggerSelectedIds.size === swaggerResult.rules.length ? 'Deselect All' : 'Select All'}
                   </button>
                 </div>
@@ -1478,8 +1646,8 @@ export default function Home() {
                       key={rule.id}
                       className={`flex items-center gap-3 p-2.5 rounded-lg border cursor-pointer transition-all ${
                         swaggerSelectedIds.has(rule.id)
-                          ? 'bg-indigo-50 border-indigo-200'
-                          : 'bg-zinc-50 border-zinc-100 opacity-60'
+                          ? 'bg-indigo-50 dark:bg-indigo-950/30 border-indigo-200 dark:border-indigo-800'
+                          : 'bg-zinc-50 dark:bg-zinc-800 border-zinc-100 dark:border-zinc-700 opacity-60'
                       }`}
                     >
                       <input
@@ -1495,18 +1663,18 @@ export default function Home() {
                         : rule.method === 'DELETE' ? 'bg-red-100 text-red-700'
                         : 'bg-zinc-100 text-zinc-500'
                       }`}>{rule.method}</span>
-                      <span className="text-xs font-mono text-zinc-700 truncate flex-1" title={rule.pattern}>{rule.pattern}</span>
+                      <span className="text-xs font-mono text-zinc-700 dark:text-zinc-300 truncate flex-1" title={rule.pattern}>{rule.pattern}</span>
                       <span className="text-[10px] text-zinc-400">{rule.status}</span>
                     </label>
                   ))}
                 </div>
 
-                <div className="flex justify-end gap-3 pt-2 border-t border-zinc-100">
-                  <button onClick={() => setIsSwaggerModalOpen(false)} className="px-5 py-2.5 text-sm font-semibold text-zinc-500 hover:text-zinc-800">Cancel</button>
+                <div className="flex justify-end gap-3 pt-2 border-t border-zinc-100 dark:border-zinc-800">
+                  <button onClick={() => setIsSwaggerModalOpen(false)} className="px-5 py-2.5 text-sm font-semibold text-zinc-500 hover:text-zinc-800 dark:hover:text-zinc-200">Cancel</button>
                   <button
                     onClick={handleSwaggerImport}
                     disabled={swaggerSelectedIds.size === 0}
-                    className="px-8 py-2.5 bg-indigo-600 text-white text-sm font-bold rounded-xl hover:bg-indigo-700 shadow-xl shadow-indigo-100 transition-all disabled:opacity-40 disabled:cursor-not-allowed"
+                    className="px-8 py-2.5 bg-indigo-600 text-white text-sm font-bold rounded-xl hover:bg-indigo-700 shadow-xl shadow-indigo-100 dark:shadow-indigo-900/20 transition-all disabled:opacity-40 disabled:cursor-not-allowed"
                   >
                     Import {swaggerSelectedIds.size} Rule{swaggerSelectedIds.size !== 1 ? 's' : ''}
                   </button>
@@ -1517,9 +1685,112 @@ export default function Home() {
             {/* Footer when no result yet */}
             {!swaggerResult && (
               <div className="mt-auto flex justify-end pt-4">
-                <button onClick={() => setIsSwaggerModalOpen(false)} className="px-5 py-2.5 text-sm font-semibold text-zinc-500 hover:text-zinc-800">Cancel</button>
+                <button onClick={() => setIsSwaggerModalOpen(false)} className="px-5 py-2.5 text-sm font-semibold text-zinc-500 hover:text-zinc-800 dark:hover:text-zinc-200">Cancel</button>
               </div>
             )}
+          </div>
+        </div>
+      )}
+
+      {/* Settings Modal */}
+      {isSettingsModalOpen && (
+        <div className="fixed inset-0 z-[60] flex items-center justify-center bg-zinc-900/40 dark:bg-black/60 backdrop-blur-sm px-4">
+          <div className="bg-white dark:bg-zinc-900 w-full max-w-sm rounded-2xl shadow-2xl border border-zinc-200 dark:border-zinc-700 p-6 overflow-hidden">
+            <div className="flex items-center justify-between mb-6">
+              <h3 className="text-lg font-bold">Settings</h3>
+              <button onClick={() => setIsSettingsModalOpen(false)} className="p-1 hover:bg-zinc-100 dark:hover:bg-zinc-800 rounded text-zinc-400">
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="space-y-5">
+              {/* Dark Mode Toggle */}
+              <div className="flex items-center justify-between p-4 rounded-xl border border-zinc-200 dark:border-zinc-700 bg-zinc-50 dark:bg-zinc-800/50">
+                <div className="flex items-center gap-3">
+                  {isDarkMode ? <Moon className="w-5 h-5 text-indigo-500" /> : <Sun className="w-5 h-5 text-amber-500" />}
+                  <div>
+                    <p className="text-sm font-semibold">Appearance</p>
+                    <p className="text-[11px] text-zinc-400">{isDarkMode ? 'Dark mode' : 'Light mode'}</p>
+                  </div>
+                </div>
+                <button
+                  onClick={() => setIsDarkMode(!isDarkMode)}
+                  className={`relative w-11 h-6 rounded-full transition-colors ${isDarkMode ? 'bg-indigo-600' : 'bg-zinc-300 dark:bg-zinc-600'}`}
+                >
+                  <span className={`absolute top-0.5 left-0.5 w-5 h-5 bg-white rounded-full shadow transition-transform ${isDarkMode ? 'translate-x-5' : ''}`} />
+                </button>
+              </div>
+
+              {/* AI Toggle */}
+              <div className="flex items-center justify-between p-4 rounded-xl border border-zinc-200 dark:border-zinc-700 bg-zinc-50 dark:bg-zinc-800/50">
+                <div className="flex items-center gap-3">
+                  <Sparkles className={`w-5 h-5 ${isAIEnabled ? 'text-purple-500' : 'text-zinc-400'}`} />
+                  <div>
+                    <div className="flex items-center gap-2">
+                      <p className="text-sm font-semibold">AI Mock Data</p>
+                      <span className="px-1.5 py-0.5 bg-purple-100 dark:bg-purple-900/40 text-purple-600 dark:text-purple-400 text-[9px] font-bold uppercase rounded">Beta</span>
+                    </div>
+                    <p className="text-[11px] text-zinc-400">Generate realistic mock responses with AI</p>
+                  </div>
+                </div>
+                <button
+                  onClick={() => setIsAIEnabled(!isAIEnabled)}
+                  className={`relative w-11 h-6 rounded-full transition-colors ${isAIEnabled ? 'bg-purple-600' : 'bg-zinc-300 dark:bg-zinc-600'}`}
+                >
+                  <span className={`absolute top-0.5 left-0.5 w-5 h-5 bg-white rounded-full shadow transition-transform ${isAIEnabled ? 'translate-x-5' : ''}`} />
+                </button>
+              </div>
+
+              {isAIEnabled && (
+                <div className="space-y-3">
+                  {/* GitHub PAT input */}
+                  <div>
+                    <label className="text-[10px] font-bold text-zinc-400 uppercase mb-1.5 block">
+                      GitHub Personal Access Token
+                    </label>
+                    <input
+                      type="password"
+                      value={githubPat}
+                      onChange={e => setGithubPat(e.target.value)}
+                      placeholder="ghp_xxxxxxxxxxxxxxxxxxxx"
+                      className="w-full px-3 py-2 bg-zinc-50 dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded-lg text-xs font-mono outline-none focus:ring-2 focus:ring-purple-500/20 focus:border-purple-500 transition-all"
+                    />
+                    <p className="text-[10px] text-zinc-400 mt-1">
+                      Required for AI generation via GitHub Models API. Stored locally.
+                    </p>
+                  </div>
+
+                  {/* Model selector */}
+                  <div>
+                    <label className="text-[10px] font-bold text-zinc-400 uppercase mb-1.5 block">
+                      AI Model
+                    </label>
+                    <select
+                      value={aiModel}
+                      onChange={e => setAiModel(e.target.value as 'gpt-4o-mini' | 'gpt-4o')}
+                      className="w-full px-3 py-2 bg-zinc-50 dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded-lg text-xs outline-none focus:ring-2 focus:ring-purple-500/20 focus:border-purple-500 transition-all"
+                    >
+                      <option value="gpt-4o-mini">GPT-4o Mini (faster)</option>
+                      <option value="gpt-4o">GPT-4o (higher quality)</option>
+                    </select>
+                  </div>
+
+                  {/* Status indicator */}
+                  <div className="p-3 bg-purple-50 dark:bg-purple-950/30 border border-purple-200 dark:border-purple-800 rounded-lg">
+                    <p className="text-[11px] text-purple-700 dark:text-purple-300 leading-relaxed">
+                      {githubPat
+                        ? 'AI mock data generation is active. New and updated mock rules will automatically get AI-enhanced response bodies.'
+                        : 'Enter your GitHub PAT above to enable AI-powered mock data generation. You can also set GITHUB_TOKEN env var on the proxy server.'
+                      }
+                    </p>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            <div className="mt-8 flex justify-end">
+              <button onClick={() => setIsSettingsModalOpen(false)} className="px-6 py-2 bg-indigo-600 text-white text-xs font-bold rounded-lg hover:bg-indigo-700 shadow-lg shadow-indigo-100 dark:shadow-indigo-900/20">Done</button>
+            </div>
           </div>
         </div>
       )}
