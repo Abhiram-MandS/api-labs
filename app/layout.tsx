@@ -4,6 +4,9 @@ import "./globals.css";
 export const metadata: Metadata = {
   title: "API Labs",
   description: "Intercept and log HTTP calls with mock support",
+  icons: {
+    icon: "/icon.svg",
+  },
 };
 
 export default function RootLayout({
@@ -12,7 +15,7 @@ export default function RootLayout({
   children: React.ReactNode;
 }>) {
   return (
-    <html lang="en">
+    <html lang="en" suppressHydrationWarning>
       <body className="font-sans antialiased">
         {children}
       </body>

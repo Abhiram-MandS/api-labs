@@ -11,6 +11,7 @@ interface MockRule {
   method: string;
   status: number;
   body: string;
+  aiBody?: string;
   enabled: boolean;
 }
 
@@ -104,6 +105,7 @@ function statusText(code: number): string {
 export function mocksToPostmanCollection(
   mocks: MockRule[],
   collectionName = 'API Labs — Mock Rules',
+  isAIEnabled = false,
 ): string {
   const items: PostmanItem[] = mocks.map((mock) => {
     const url = parsePattern(mock.pattern);
@@ -133,7 +135,7 @@ export function mocksToPostmanCollection(
       header: [
         { key: 'Content-Type', value: 'application/json', type: 'text' },
       ],
-      body: mock.body,
+      body: (isAIEnabled && mock.aiBody) ? mock.aiBody : mock.body,
     };
 
     return {
