@@ -1946,107 +1946,134 @@ export default function Home() {
       {/* Mock Modal */}
       {isMockModalOpen && (
         <div className="fixed inset-0 z-[60] flex items-center justify-center bg-zinc-900/40 dark:bg-black/60 backdrop-blur-sm px-4">
-          <div className="bg-white dark:bg-zinc-900 w-full max-w-lg rounded-2xl shadow-2xl border border-zinc-200 dark:border-zinc-700 p-8 overflow-hidden">
-            <h3 className="text-xl font-bold mb-1">{editingMockId !== null ? 'Edit Mock Rule' : 'Create Mock Rule'}</h3>
-            <p className="text-zinc-500 dark:text-zinc-400 text-sm mb-8">{editingMockId !== null ? 'Update the mock rule configuration below.' : 'Requests matching this pattern will return the body defined below.'}</p>
-            
-            <div className="space-y-5">
+          <div className={`bg-white dark:bg-zinc-900 w-full rounded-2xl shadow-2xl border border-zinc-200 dark:border-zinc-700 overflow-hidden flex flex-col max-h-[92vh] ${newMock.mockType === 'dynamic' ? 'max-w-4xl' : 'max-w-2xl'} transition-all duration-300`}>
+            {/* Header */}
+            <div className="flex items-start justify-between px-8 pt-8 pb-4 border-b border-zinc-100 dark:border-zinc-800 shrink-0">
               <div>
-                <label className="text-[10px] font-bold text-zinc-400 uppercase mb-1.5 block">URL Pattern (contains string)</label>
-                <input 
-                  autoFocus
-                  value={newMock.pattern}
-                  onChange={e => setNewMock({...newMock, pattern: e.target.value})}
-                  placeholder="/api/v1/users/profile" 
-                  className="w-full px-4 py-2.5 bg-zinc-50 dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded-xl text-sm outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 transition-all font-mono"
-                />
+                <h3 className="text-xl font-bold">{editingMockId !== null ? 'Edit Mock Rule' : 'Create Mock Rule'}</h3>
+                <p className="text-zinc-500 dark:text-zinc-400 text-sm mt-1">{editingMockId !== null ? 'Update the mock rule configuration below.' : 'Requests matching this pattern will return the body defined below.'}</p>
               </div>
-
-              <div className="grid grid-cols-2 gap-4">
-                <div>
-                  <label className="text-[10px] font-bold text-zinc-400 uppercase mb-1.5 block">HTTP Method</label>
-                  <select 
-                    value={newMock.method}
-                    onChange={e => setNewMock({...newMock, method: e.target.value})}
-                    className="w-full px-4 py-2.5 bg-zinc-50 dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded-xl text-sm outline-none"
-                  >
-                    <option>GET</option><option>POST</option><option>PUT</option><option>DELETE</option>
-                  </select>
-                </div>
-                <div>
-                  <label className="text-[10px] font-bold text-zinc-400 uppercase mb-1.5 block">Response Status</label>
-                  <input 
-                    type="number" 
-                    value={newMock.status}
-                    onChange={e => setNewMock({...newMock, status: parseInt(e.target.value)})}
-                    className="w-full px-4 py-2.5 bg-zinc-50 dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded-xl text-sm outline-none"
-                  />
-                </div>
-              </div>
-
-              <div>
-                <label className="text-[10px] font-bold text-zinc-400 uppercase mb-1.5 block">Response Type</label>
-                <div className="flex items-center gap-2 p-1 bg-zinc-100 dark:bg-zinc-800 rounded-xl">
-                  <button
-                    type="button"
-                    onClick={() => setNewMock({...newMock, mockType: 'static'})}
-                    className={`flex-1 px-3 py-2 text-xs font-semibold rounded-lg transition-all flex items-center justify-center gap-1.5 ${
-                      newMock.mockType === 'static'
-                        ? 'bg-white dark:bg-zinc-700 text-zinc-800 dark:text-zinc-100 shadow-sm'
-                        : 'text-zinc-400 hover:text-zinc-600 dark:hover:text-zinc-300'
-                    }`}
-                  >
-                    <FileText className="w-3.5 h-3.5" /> Static
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setNewMock({...newMock, mockType: 'dynamic'})}
-                    className={`flex-1 px-3 py-2 text-xs font-semibold rounded-lg transition-all flex items-center justify-center gap-1.5 ${
-                      newMock.mockType === 'dynamic'
-                        ? 'bg-purple-600 text-white shadow-sm shadow-purple-200 dark:shadow-purple-900/30'
-                        : 'text-zinc-400 hover:text-zinc-600 dark:hover:text-zinc-300'
-                    }`}
-                  >
-                    <Zap className="w-3.5 h-3.5" /> Dynamic
-                  </button>
-                </div>
-                {newMock.mockType === 'dynamic' && (
-                  <p className="text-[10px] text-purple-500 dark:text-purple-400 mt-1.5 flex items-center gap-1">
-                    <Sparkles className="w-3 h-3" /> AI generates a fresh response on every request
-                  </p>
-                )}
-              </div>
-
-              {newMock.mockType === 'dynamic' && (
-                <div>
-                  <label className="text-[10px] font-bold text-zinc-400 uppercase mb-1.5 block">API Behavior Description</label>
-                  <textarea
-                    rows={3}
-                    value={newMock.description}
-                    onChange={e => setNewMock({...newMock, description: e.target.value})}
-                    placeholder="e.g. Returns a paginated list of users with name, email, avatar, and role. Supports filtering by role (admin, user, moderator). POST creates a new user and echoes back the created object with a generated ID."
-                    className="w-full px-4 py-3 bg-purple-50 dark:bg-purple-950/30 text-purple-800 dark:text-purple-200 border border-purple-200 dark:border-purple-800 rounded-xl text-xs outline-none focus:ring-2 focus:ring-purple-500/20 focus:border-purple-500 transition-all leading-relaxed resize-y placeholder:text-purple-300 dark:placeholder:text-purple-600"
-                  />
-                  <p className="text-[10px] text-zinc-400 mt-1">Describe what this API does in plain English. The AI will use this to generate contextually accurate responses.</p>
-                </div>
-              )}
-
-              <div>
-                <label className="text-[10px] font-bold text-zinc-400 uppercase mb-1.5 block">{newMock.mockType === 'dynamic' ? 'Template JSON Body (optional — defines response shape)' : 'JSON Body'}</label>
-                <textarea 
-                  rows={Math.min(20, Math.max(6, newMock.body.split('\n').length + 1))}
-                  value={newMock.body}
-                  onChange={e => setNewMock({...newMock, body: e.target.value})}
-                  className="w-full px-4 py-3 bg-zinc-900 text-indigo-300 border border-zinc-800 rounded-xl text-xs font-mono outline-none focus:border-indigo-500/50 transition-all leading-relaxed max-h-[50vh] overflow-y-auto resize-y"
-                />
-                {newMock.mockType === 'dynamic' && (
-                  <p className="text-[10px] text-zinc-400 mt-1">Optional. Provide a JSON template to constrain the response structure. If empty, the AI infers the shape from your description.</p>
-                )}
-              </div>
+              <button onClick={() => { setIsMockModalOpen(false); setEditingMockId(null); setNewMock({ pattern: '', method: 'GET', status: 200, body: '{\n  "status": "success"\n}', mockType: 'static', description: '' }); }} className="p-1.5 hover:bg-zinc-100 dark:hover:bg-zinc-800 rounded-lg text-zinc-400 hover:text-zinc-600 transition-colors">
+                <X className="w-5 h-5" />
+              </button>
             </div>
 
-            <div className="mt-10 flex justify-end gap-3">
-              <button onClick={() => { setIsMockModalOpen(false); setEditingMockId(null); setNewMock({ pattern: '', method: 'GET', status: 200, body: '{\n  "status": "success"\n}', mockType: 'static', description: '' }); }} className="px-5 py-2.5 text-sm font-semibold text-zinc-500 hover:text-zinc-800 dark:hover:text-zinc-200">Cancel</button>
+            {/* Body */}
+            <div className="px-8 py-6 overflow-y-auto flex-1">
+              {/* Top row: URL, Method, Status, Response Type — always full width */}
+              <div className="space-y-5 mb-6">
+                <div>
+                  <label className="text-[10px] font-bold text-zinc-400 uppercase mb-1.5 block">URL Pattern (contains string)</label>
+                  <input 
+                    autoFocus
+                    value={newMock.pattern}
+                    onChange={e => setNewMock({...newMock, pattern: e.target.value})}
+                    placeholder="/api/v1/users/profile" 
+                    className="w-full px-4 py-2.5 bg-zinc-50 dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded-xl text-sm outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 transition-all font-mono"
+                  />
+                </div>
+
+                <div className="grid grid-cols-3 gap-4">
+                  <div>
+                    <label className="text-[10px] font-bold text-zinc-400 uppercase mb-1.5 block">HTTP Method</label>
+                    <select 
+                      value={newMock.method}
+                      onChange={e => setNewMock({...newMock, method: e.target.value})}
+                      className="w-full px-4 py-2.5 bg-zinc-50 dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded-xl text-sm outline-none"
+                    >
+                      <option>GET</option><option>POST</option><option>PUT</option><option>DELETE</option><option>PATCH</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label className="text-[10px] font-bold text-zinc-400 uppercase mb-1.5 block">Response Status</label>
+                    <input 
+                      type="number" 
+                      value={newMock.status}
+                      onChange={e => setNewMock({...newMock, status: parseInt(e.target.value)})}
+                      className="w-full px-4 py-2.5 bg-zinc-50 dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded-xl text-sm outline-none"
+                    />
+                  </div>
+                  <div>
+                    <label className="text-[10px] font-bold text-zinc-400 uppercase mb-1.5 block">Response Type</label>
+                    <div className="flex items-center gap-1 p-1 bg-zinc-100 dark:bg-zinc-800 rounded-xl h-[42px]">
+                      <button
+                        type="button"
+                        onClick={() => setNewMock({...newMock, mockType: 'static'})}
+                        className={`flex-1 px-3 py-1.5 text-xs font-semibold rounded-lg transition-all flex items-center justify-center gap-1.5 ${
+                          newMock.mockType === 'static'
+                            ? 'bg-white dark:bg-zinc-700 text-zinc-800 dark:text-zinc-100 shadow-sm'
+                            : 'text-zinc-400 hover:text-zinc-600 dark:hover:text-zinc-300'
+                        }`}
+                      >
+                        <FileText className="w-3.5 h-3.5" /> Static
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setNewMock({...newMock, mockType: 'dynamic'})}
+                        className={`flex-1 px-3 py-1.5 text-xs font-semibold rounded-lg transition-all flex items-center justify-center gap-1.5 ${
+                          newMock.mockType === 'dynamic'
+                            ? 'bg-purple-600 text-white shadow-sm shadow-purple-200 dark:shadow-purple-900/30'
+                            : 'text-zinc-400 hover:text-zinc-600 dark:hover:text-zinc-300'
+                        }`}
+                      >
+                        <Zap className="w-3.5 h-3.5" /> Dynamic
+                      </button>
+                    </div>
+                  </div>
+                </div>
+
+                {newMock.mockType === 'dynamic' && (
+                  <div className="flex items-center gap-2 px-3 py-2 bg-purple-50 dark:bg-purple-950/20 border border-purple-200 dark:border-purple-800/50 rounded-xl">
+                    <Sparkles className="w-4 h-4 text-purple-500 shrink-0" />
+                    <p className="text-xs text-purple-600 dark:text-purple-400">Dynamic mode — AI generates a <strong>fresh, unique response</strong> on every request using your description and template.</p>
+                  </div>
+                )}
+              </div>
+
+              {/* Content area: side-by-side for dynamic, stacked for static */}
+              {newMock.mockType === 'dynamic' ? (
+                <div className="grid grid-cols-2 gap-6">
+                  {/* Left: Description */}
+                  <div className="flex flex-col">
+                    <label className="text-[10px] font-bold text-zinc-400 uppercase mb-1.5 block">API Behavior Description</label>
+                    <textarea
+                      rows={12}
+                      value={newMock.description}
+                      onChange={e => setNewMock({...newMock, description: e.target.value})}
+                      placeholder={"Describe what this API does in plain English.\n\nExample:\nReturns a paginated list of franchise partners with details including partner number, name, and modification info.\n\nEach franchise has a unique franchisee number and name, with an associated partner containing partner number and name.\n\nThe modifiedBy field tracks who last edited the record."}
+                      className="flex-1 w-full px-4 py-3 bg-purple-50 dark:bg-purple-950/30 text-purple-800 dark:text-purple-200 border border-purple-200 dark:border-purple-800 rounded-xl text-xs outline-none focus:ring-2 focus:ring-purple-500/20 focus:border-purple-500 transition-all leading-relaxed resize-none placeholder:text-purple-300 dark:placeholder:text-purple-600"
+                    />
+                    <p className="text-[10px] text-zinc-400 mt-2">The AI uses this description as the primary context for generating realistic, contextually accurate responses every time.</p>
+                  </div>
+                  {/* Right: JSON Template */}
+                  <div className="flex flex-col">
+                    <label className="text-[10px] font-bold text-zinc-400 uppercase mb-1.5 block">Response Template <span className="text-zinc-300 dark:text-zinc-600 font-normal normal-case">(optional — defines shape)</span></label>
+                    <textarea 
+                      rows={12}
+                      value={newMock.body}
+                      onChange={e => setNewMock({...newMock, body: e.target.value})}
+                      placeholder={'{\n  "data": [\n    {\n      "id": 1,\n      "name": "string"\n    }\n  ]\n}'}
+                      className="flex-1 w-full px-4 py-3 bg-zinc-900 text-indigo-300 border border-zinc-800 rounded-xl text-xs font-mono outline-none focus:border-indigo-500/50 transition-all leading-relaxed resize-none"
+                    />
+                    <p className="text-[10px] text-zinc-400 mt-2">Provide a JSON shape to constrain responses. If empty, the AI infers structure from your description.</p>
+                  </div>
+                </div>
+              ) : (
+                <div>
+                  <label className="text-[10px] font-bold text-zinc-400 uppercase mb-1.5 block">JSON Body</label>
+                  <textarea 
+                    rows={Math.min(16, Math.max(8, newMock.body.split('\n').length + 1))}
+                    value={newMock.body}
+                    onChange={e => setNewMock({...newMock, body: e.target.value})}
+                    className="w-full px-4 py-3 bg-zinc-900 text-indigo-300 border border-zinc-800 rounded-xl text-xs font-mono outline-none focus:border-indigo-500/50 transition-all leading-relaxed max-h-[50vh] overflow-y-auto resize-y"
+                  />
+                </div>
+              )}
+            </div>
+
+            {/* Footer */}
+            <div className="px-8 py-5 border-t border-zinc-100 dark:border-zinc-800 flex justify-end gap-3 shrink-0 bg-zinc-50/50 dark:bg-zinc-800/30">
+              <button onClick={() => { setIsMockModalOpen(false); setEditingMockId(null); setNewMock({ pattern: '', method: 'GET', status: 200, body: '{\n  "status": "success"\n}', mockType: 'static', description: '' }); }} className="px-5 py-2.5 text-sm font-semibold text-zinc-500 hover:text-zinc-800 dark:hover:text-zinc-200 transition-colors">Cancel</button>
               <button onClick={handleAddMock} className="px-8 py-2.5 bg-indigo-600 text-white text-sm font-bold rounded-xl hover:bg-indigo-700 shadow-xl shadow-indigo-100 dark:shadow-indigo-900/20 transition-all">{editingMockId !== null ? 'Save Changes' : 'Create Rule'}</button>
             </div>
           </div>
