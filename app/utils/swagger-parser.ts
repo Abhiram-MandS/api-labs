@@ -21,7 +21,9 @@ export interface MockRule {
 let _idCounter = 0;
 const uniqueId = () => {
   _idCounter++;
-  return Date.now() * 1000 + _idCounter;
+  return typeof crypto !== 'undefined' && crypto.randomUUID
+    ? parseInt(crypto.randomUUID().replace(/-/g, '').slice(0, 12), 16) + _idCounter
+    : Date.now() * 1000 + Math.floor(Math.random() * 10000) + _idCounter;
 };
 
 // ---------------------------------------------------------------------------

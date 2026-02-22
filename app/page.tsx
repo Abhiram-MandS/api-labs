@@ -32,7 +32,18 @@ import {
   MinusSquare,
   Moon,
   Sun,
-  Sparkles
+  Sparkles,
+  RefreshCw,
+  Check,
+  Loader2,
+  MessageSquare,
+  Brain,
+  Lightbulb,
+  TrendingUp,
+  ArrowRight,
+  BarChart3,
+  Info,
+  Zap
 } from 'lucide-react';
 import io from 'socket.io-client';
 import { parseSwaggerSpec, type SwaggerParseResult } from './utils/swagger-parser';
@@ -83,6 +94,8 @@ interface MockRule {
   method: string;
   status: number;
   body: string;
+  mockType?: 'static' | 'dynamic';
+  description?: string;
   aiBody?: string;
   aiStatus?: 'idle' | 'generating' | 'done' | 'error';
   aiError?: string;
@@ -103,6 +116,41 @@ interface ContextMenu {
   method: string;
   status?: number | string;
   body?: unknown;
+}
+
+interface AIInsight {
+  type: 'error' | 'warning' | 'info' | 'suggestion';
+  title: string;
+  description: string;
+  affectedUrls: string[];
+  severity: 'high' | 'medium' | 'low';
+}
+
+interface AIAnalysisResult {
+  insights: AIInsight[];
+  summary: {
+    totalRequests: number;
+    errorRate: string;
+    avgDuration: string;
+    topEndpoints: { url: string; count: number }[];
+    statusBreakdown: Record<string, number>;
+  };
+}
+
+interface MockSuggestion {
+  pattern: string;
+  method: string;
+  status: number;
+  body: string;
+  reason: string;
+  confidence: 'high' | 'medium' | 'low';
+}
+
+interface NLGeneratedRule {
+  pattern: string;
+  method: string;
+  status: number;
+  body: string;
 }
 
 export default function Home() {
@@ -142,6 +190,7 @@ export default function Home() {
   const [swaggerResult, setSwaggerResult] = useState<SwaggerParseResult | null>(null);
   const [swaggerSelectedIds, setSwaggerSelectedIds] = useState<Set<number>>(new Set());
   const [isSettingsModalOpen, setIsSettingsModalOpen] = useState(false);
+  const [aiTestModal, setAiTestModal] = useState<{ open: boolean; mock: MockRule | null; generatedBody: string; status: 'idle' | 'generating' | 'done' | 'error'; error: string }>({ open: false, mock: null, generatedBody: '', status: 'idle', error: '' });
   const [isDarkMode, setIsDarkMode] = useState(false);
   const [isAIEnabled, setIsAIEnabled] = useState(false);
   const [githubPat, setGithubPat] = useState('');
@@ -149,13 +198,38 @@ export default function Home() {
   const socketRef = useRef<ReturnType<typeof io> | null>(null);
   const skipNextSync = useRef(false);
   const hydratedRef = useRef(false);
+  const isAIEnabledRef = useRef(isAIEnabled);
+  const mocksRef = useRef(mocks);
+
+  // --- Phase 2+3 AI State ---
+  const [nlPrompt, setNlPrompt] = useState('');
+  const [nlStatus, setNlStatus] = useState<'idle' | 'generating' | 'done' | 'error'>('idle');
+  const [nlResults, setNlResults] = useState<NLGeneratedRule[]>([]);
+  const [nlError, setNlError] = useState('');
+  const [isNlModalOpen, setIsNlModalOpen] = useState(false);
+  const [nlSelectedIds, setNlSelectedIds] = useState<Set<number>>(new Set());
+  const [nlExpandedRule, setNlExpandedRule] = useState<number | null>(null);
+
+  const [aiAnalysis, setAiAnalysis] = useState<AIAnalysisResult | null>(null);
+  const [aiAnalysisStatus, setAiAnalysisStatus] = useState<'idle' | 'analyzing' | 'done' | 'error'>('idle');
+  const [aiAnalysisError, setAiAnalysisError] = useState('');
+  const [isInsightsPanelOpen, setIsInsightsPanelOpen] = useState(false);
+
+  const [mockSuggestions, setMockSuggestions] = useState<MockSuggestion[]>([]);
+  const [suggestionsStatus, setSuggestionsStatus] = useState<'idle' | 'loading' | 'done' | 'error'>('idle');
+  const [dismissedSuggestions, setDismissedSuggestions] = useState<Set<string>>(new Set());
+
+  const [showDiffView, setShowDiffView] = useState(false);
+  const [customSystemPrompt, setCustomSystemPrompt] = useState('');
   
   // Form States
   const [newMock, setNewMock] = useState({ 
     pattern: '', 
     method: 'GET', 
     status: 200, 
-    body: '{\n  "status": "success"\n}' 
+    body: '{\n  "status": "success"\n}',
+    mockType: 'static' as 'static' | 'dynamic',
+    description: '' 
   });
   const [newDomain, setNewDomain] = useState('');
 
@@ -168,8 +242,13 @@ export default function Home() {
     setIsAIEnabled(loadFromStorage('api-labs:aiEnabled', false));
     setGithubPat(loadFromStorage('api-labs:githubPat', ''));
     setAiModel(loadFromStorage('api-labs:aiModel', 'gpt-4o-mini'));
+    setCustomSystemPrompt(loadFromStorage('api-labs:customSystemPrompt', ''));
     hydratedRef.current = true;
   }, []);
+
+  // --- Keep refs in sync with state ---
+  useEffect(() => { isAIEnabledRef.current = isAIEnabled; }, [isAIEnabled]);
+  useEffect(() => { mocksRef.current = mocks; }, [mocks]);
 
   // --- Persist to localStorage (skip the initial hydration write-back) ---
   useEffect(() => { if (hydratedRef.current) localStorage.setItem('api-labs:mocks', JSON.stringify(mocks)); }, [mocks]);
@@ -179,6 +258,7 @@ export default function Home() {
   useEffect(() => { if (hydratedRef.current) localStorage.setItem('api-labs:aiEnabled', JSON.stringify(isAIEnabled)); }, [isAIEnabled]);
   useEffect(() => { if (hydratedRef.current) localStorage.setItem('api-labs:githubPat', JSON.stringify(githubPat)); }, [githubPat]);
   useEffect(() => { if (hydratedRef.current) localStorage.setItem('api-labs:aiModel', JSON.stringify(aiModel)); }, [aiModel]);
+  useEffect(() => { if (hydratedRef.current) localStorage.setItem('api-labs:customSystemPrompt', JSON.stringify(customSystemPrompt)); }, [customSystemPrompt]);
 
   // --- Dark mode class management ---
   useEffect(() => {
@@ -201,6 +281,12 @@ export default function Home() {
     socket.on('connect', () => {
       console.log('✅ Connected to proxy server');
       setProxyConnected(true);
+      // Re-sync settings & mock rules on every connect/reconnect
+      // so the server always has the latest client state
+      socket.emit('settings-update', { isAIEnabled: isAIEnabledRef.current });
+      if (mocksRef.current.length > 0) {
+        socket.emit('mock-rules-update', mocksRef.current);
+      }
     });
 
     socket.on('disconnect', () => {
@@ -216,6 +302,13 @@ export default function Home() {
     // Receive mock rules synced from server (e.g. on reconnect or from another client)
     socket.on('mock-rules-sync', (rules: MockRule[]) => {
       console.log('🎭 Mock rules synced from server:', rules.length);
+      // If server sends empty rules but client has data (e.g. after server restart),
+      // keep client state and re-send to the server instead of wiping
+      if (rules.length === 0 && mocksRef.current.length > 0) {
+        console.log('🔄 Server has empty rules, re-sending client mocks');
+        socket.emit('mock-rules-update', mocksRef.current);
+        return;
+      }
       skipNextSync.current = true;
       setMocks(dedup(rules));
     });
@@ -383,14 +476,14 @@ export default function Home() {
     let savedMockId: number;
     if (editingMockId !== null) {
       savedMockId = editingMockId;
-      setMocks(mocks.map(m => m.id === editingMockId ? { ...m, pattern: newMock.pattern, method: newMock.method, status: newMock.status, body: newMock.body, aiBody: undefined, aiStatus: 'idle' as const } : m));
+      setMocks(mocks.map(m => m.id === editingMockId ? { ...m, pattern: newMock.pattern, method: newMock.method, status: newMock.status, body: newMock.body, mockType: newMock.mockType, description: newMock.description, aiBody: undefined, aiStatus: 'idle' as const } : m));
       setEditingMockId(null);
     } else {
       savedMockId = uniqueId();
       setMocks([...mocks, { ...newMock, id: savedMockId, enabled: true, aiStatus: 'idle' as const }]);
     }
     setIsMockModalOpen(false);
-    setNewMock({ pattern: '', method: 'GET', status: 200, body: '{\n  "status": "success"\n}' });
+    setNewMock({ pattern: '', method: 'GET', status: 200, body: '{\n  "status": "success"\n}', mockType: 'static', description: '' });
 
     // Trigger AI generation if AI is enabled
     if (isAIEnabled) {
@@ -401,7 +494,7 @@ export default function Home() {
 
   const handleEditMock = (mock: MockRule) => {
     setEditingMockId(mock.id);
-    setNewMock({ pattern: mock.pattern, method: mock.method, status: mock.status, body: mock.body });
+    setNewMock({ pattern: mock.pattern, method: mock.method, status: mock.status, body: mock.body, mockType: mock.mockType || 'static', description: mock.description || '' });
     setIsMockModalOpen(true);
   };
 
@@ -494,6 +587,185 @@ export default function Home() {
     setSelectedMockIds(new Set());
   };
 
+  // --- Natural Language Mock Builder ---
+  const handleNlGenerate = useCallback(async () => {
+    if (!nlPrompt.trim()) return;
+    setNlStatus('generating');
+    setNlError('');
+    setNlResults([]);
+
+    try {
+      const response = await originalFetch('http://localhost:8888/api/ai/natural-language', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(githubPat ? { 'X-GitHub-Token': githubPat } : {}),
+        },
+        body: JSON.stringify({ prompt: nlPrompt, model: aiModel }),
+      });
+
+      if (!response.ok) {
+        const errorData = await response.json();
+        throw new Error(errorData.error || `HTTP ${response.status}`);
+      }
+
+      const data = await response.json();
+      setNlResults(data.rules || []);
+      setNlSelectedIds(new Set(data.rules.map((_: NLGeneratedRule, i: number) => i)));
+      setNlStatus('done');
+    } catch (err) {
+      setNlError(err instanceof Error ? err.message : String(err));
+      setNlStatus('error');
+    }
+  }, [nlPrompt, githubPat, aiModel]);
+
+  const handleNlImport = () => {
+    const selected = nlResults.filter((_, i) => nlSelectedIds.has(i));
+    const withIds = selected.map(r => ({
+      ...r,
+      id: uniqueId(),
+      enabled: true,
+      aiStatus: 'idle' as const,
+    }));
+    setMocks(prev => dedup([...prev, ...withIds]));
+    setIsNlModalOpen(false);
+    setNlPrompt('');
+    setNlResults([]);
+    setNlStatus('idle');
+
+    // Trigger AI generation for imported rules if AI is enabled
+    if (isAIEnabled) {
+      setTimeout(() => {
+        withIds.forEach(r => generateAIBody(r.id, r as MockRule));
+      }, 200);
+    }
+  };
+
+  // --- AI Traffic Analysis ---
+  const handleAnalyzeTraffic = useCallback(async () => {
+    setAiAnalysisStatus('analyzing');
+    setAiAnalysisError('');
+
+    try {
+      const response = await originalFetch('http://localhost:8888/api/ai/analyze', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(githubPat ? { 'X-GitHub-Token': githubPat } : {}),
+        },
+        body: JSON.stringify({ logs, model: aiModel }),
+      });
+
+      if (!response.ok) {
+        const errorData = await response.json();
+        throw new Error(errorData.error || `HTTP ${response.status}`);
+      }
+
+      const data = await response.json();
+      setAiAnalysis(data);
+      setAiAnalysisStatus('done');
+      setIsInsightsPanelOpen(true);
+    } catch (err) {
+      setAiAnalysisError(err instanceof Error ? err.message : String(err));
+      setAiAnalysisStatus('error');
+    }
+  }, [logs, githubPat, aiModel]);
+
+  // --- Auto Mock Suggestions ---
+  const handleGetSuggestions = useCallback(async () => {
+    setSuggestionsStatus('loading');
+
+    // Build endpoint stats from logs
+    const statsMap = new Map<string, { url: string; method: string; count: number; avgDuration: number; lastStatus: number | string }>();
+    for (const log of logs) {
+      const key = `${log.method}:${log.url}`;
+      const existing = statsMap.get(key);
+      if (existing) {
+        existing.count++;
+        existing.avgDuration = (existing.avgDuration * (existing.count - 1) + log.duration) / existing.count;
+        existing.lastStatus = log.status;
+      } else {
+        statsMap.set(key, { url: log.url, method: log.method, count: 1, avgDuration: log.duration, lastStatus: log.status });
+      }
+    }
+
+    const endpointStats = Array.from(statsMap.values()).filter(s => s.count >= 2).sort((a, b) => b.count - a.count).slice(0, 20);
+
+    if (endpointStats.length === 0) {
+      setSuggestionsStatus('idle');
+      return;
+    }
+
+    try {
+      const response = await originalFetch('http://localhost:8888/api/ai/suggest-mocks', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(githubPat ? { 'X-GitHub-Token': githubPat } : {}),
+        },
+        body: JSON.stringify({ endpointStats, model: aiModel }),
+      });
+
+      if (!response.ok) {
+        const errorData = await response.json();
+        throw new Error(errorData.error || `HTTP ${response.status}`);
+      }
+
+      const data = await response.json();
+      setMockSuggestions(data.suggestions || []);
+      setSuggestionsStatus('done');
+    } catch (err) {
+      console.error('Mock suggestion error:', err);
+      setSuggestionsStatus('error');
+    }
+  }, [logs, githubPat, aiModel]);
+
+  const acceptSuggestion = (suggestion: MockSuggestion) => {
+    const newRule: MockRule = {
+      id: uniqueId(),
+      pattern: suggestion.pattern,
+      method: suggestion.method,
+      status: suggestion.status,
+      body: typeof suggestion.body === 'string' ? suggestion.body : JSON.stringify(suggestion.body, null, 2),
+      enabled: true,
+      aiStatus: 'idle',
+    };
+    setMocks(prev => dedup([...prev, newRule]));
+    setDismissedSuggestions(prev => new Set([...prev, `${suggestion.method}:${suggestion.pattern}`]));
+
+    if (isAIEnabled) {
+      setTimeout(() => generateAIBody(newRule.id, newRule), 100);
+    }
+  };
+
+  const dismissSuggestion = (suggestion: MockSuggestion) => {
+    setDismissedSuggestions(prev => new Set([...prev, `${suggestion.method}:${suggestion.pattern}`]));
+  };
+
+  const activeSuggestions = useMemo(() =>
+    mockSuggestions.filter(s => !dismissedSuggestions.has(`${s.method}:${s.pattern}`)),
+    [mockSuggestions, dismissedSuggestions]
+  );
+
+  // --- Endpoint Stats for badges ---
+  const endpointErrorCounts = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const log of logs) {
+      if (typeof log.status === 'number' && log.status >= 400) {
+        const key = log.url;
+        counts.set(key, (counts.get(key) || 0) + 1);
+      } else if (log.status === 'FAIL') {
+        counts.set(log.url, (counts.get(log.url) || 0) + 1);
+      }
+    }
+    return counts;
+  }, [logs]);
+
+  const avgDuration = useMemo(() => {
+    if (logs.length === 0) return 0;
+    return logs.reduce((sum, l) => sum + (l.duration || 0), 0) / logs.length;
+  }, [logs]);
+
   // --- Import / Export Mock Rules ---
   const exportMocks = () => {
     const toExport = selectedMockIds.size > 0 ? mocks.filter(m => selectedMockIds.has(m.id)) : filteredMocks;
@@ -532,14 +804,14 @@ export default function Home() {
           const imported = JSON.parse(ev.target?.result as string);
           if (!Array.isArray(imported)) throw new Error('Invalid format');
           const validated: MockRule[] = imported.map((rule: Record<string, unknown>) => ({
-            id: typeof rule.id === 'number' ? rule.id : uniqueId(),
+            id: uniqueId(),
             pattern: String(rule.pattern ?? ''),
             method: String(rule.method ?? 'GET'),
             status: Number(rule.status ?? 200),
             body: typeof rule.body === 'string' ? rule.body : JSON.stringify(rule.body ?? {}, null, 2),
             enabled: rule.enabled !== false,
           }));
-          setMocks(prev => [...prev, ...validated]);
+          setMocks(prev => dedup([...prev, ...validated]));
         } catch {
           alert('Invalid mock rules file. Expected a JSON array of mock rules.');
         }
@@ -579,7 +851,7 @@ export default function Home() {
     const selected = swaggerResult.rules.filter(r => swaggerSelectedIds.has(r.id));
     // Re-assign unique IDs to avoid collisions
     const withIds = selected.map(r => ({ ...r, id: uniqueId(), aiStatus: 'idle' as const }));
-    setMocks(prev => [...prev, ...withIds]);
+    setMocks(prev => dedup([...prev, ...withIds]));
     setIsSwaggerModalOpen(false);
     setSwaggerInput('');
     setSwaggerResult(null);
@@ -799,6 +1071,104 @@ export default function Home() {
             </div>
           </section>
 
+          {/* AI Insights Section */}
+          {isAIEnabled && (
+            <section>
+              <div className="flex items-center justify-between mb-3 px-2">
+                <h2 className="text-[10px] font-bold text-zinc-400 uppercase tracking-widest flex items-center">
+                  <Brain className="w-3 h-3 mr-1" /> AI Insights
+                </h2>
+                <button
+                  onClick={handleAnalyzeTraffic}
+                  disabled={aiAnalysisStatus === 'analyzing' || logs.length === 0}
+                  className="p-1 hover:bg-zinc-100 dark:hover:bg-zinc-800 rounded text-zinc-400 disabled:opacity-30"
+                  title="Analyze traffic"
+                >
+                  {aiAnalysisStatus === 'analyzing' ? <Loader2 className="w-4 h-4 animate-spin text-purple-500" /> : <BarChart3 className="w-4 h-4" />}
+                </button>
+              </div>
+
+              {aiAnalysisStatus === 'done' && aiAnalysis && (
+                <div className="space-y-2">
+                  {/* Summary card */}
+                  <button
+                    onClick={() => setIsInsightsPanelOpen(!isInsightsPanelOpen)}
+                    className="w-full text-left p-3 rounded-lg border border-purple-200 dark:border-purple-800 bg-purple-50/50 dark:bg-purple-950/30 hover:bg-purple-50 dark:hover:bg-purple-950/50 transition-all group"
+                  >
+                    <div className="flex items-center justify-between mb-1">
+                      <span className="text-xs font-semibold text-purple-700 dark:text-purple-300">{aiAnalysis.insights.length} insight{aiAnalysis.insights.length !== 1 ? 's' : ''}</span>
+                      {isInsightsPanelOpen ? <ChevronDown className="w-3 h-3 text-purple-400" /> : <ChevronRight className="w-3 h-3 text-purple-400" />}
+                    </div>
+                    <div className="flex items-center gap-2 text-[10px]">
+                      <span className="text-purple-600 dark:text-purple-400">{aiAnalysis.summary.errorRate} errors</span>
+                      <span className="text-zinc-400">avg {aiAnalysis.summary.avgDuration}</span>
+                    </div>
+                  </button>
+
+                  {/* Insight details */}
+                  {isInsightsPanelOpen && (
+                    <div className="space-y-1.5 max-h-48 overflow-y-auto">
+                      {aiAnalysis.insights.map((insight, i) => (
+                        <div key={i} className={`px-3 py-2 rounded-md text-[11px] border ${
+                          insight.type === 'error' ? 'bg-red-50 dark:bg-red-950/30 border-red-200 dark:border-red-800 text-red-700 dark:text-red-400' :
+                          insight.type === 'warning' ? 'bg-amber-50 dark:bg-amber-950/30 border-amber-200 dark:border-amber-800 text-amber-700 dark:text-amber-400' :
+                          insight.type === 'suggestion' ? 'bg-blue-50 dark:bg-blue-950/30 border-blue-200 dark:border-blue-800 text-blue-700 dark:text-blue-400' :
+                          'bg-zinc-50 dark:bg-zinc-800 border-zinc-200 dark:border-zinc-700 text-zinc-600 dark:text-zinc-400'
+                        }`}>
+                          <div className="flex items-center gap-1.5 mb-0.5">
+                            {insight.type === 'error' ? <AlertCircle className="w-3 h-3" /> :
+                             insight.type === 'warning' ? <AlertCircle className="w-3 h-3" /> :
+                             insight.type === 'suggestion' ? <Lightbulb className="w-3 h-3" /> :
+                             <Info className="w-3 h-3" />}
+                            <span className="font-semibold truncate">{insight.title}</span>
+                          </div>
+                          <p className="text-[10px] opacity-80 leading-relaxed">{insight.description}</p>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {aiAnalysisStatus === 'error' && (
+                <p className="text-[11px] text-red-500 px-2">{aiAnalysisError || 'Analysis failed'}</p>
+              )}
+
+              {aiAnalysisStatus === 'idle' && logs.length > 0 && (
+                <p className="text-[11px] text-zinc-400 text-center py-2 italic">Click analyze to get insights</p>
+              )}
+              {logs.length === 0 && (
+                <p className="text-[11px] text-zinc-400 text-center py-2 italic">Capture traffic first</p>
+              )}
+
+              {/* Mock Suggestions */}
+              {activeSuggestions.length > 0 && (
+                <div className="mt-3 space-y-1.5">
+                  <div className="text-[10px] font-bold text-zinc-400 uppercase tracking-widest px-2 flex items-center">
+                    <Lightbulb className="w-3 h-3 mr-1" /> Suggestions
+                  </div>
+                  {activeSuggestions.slice(0, 3).map((s, i) => (
+                    <div key={i} className="px-3 py-2 rounded-md text-[11px] bg-indigo-50/50 dark:bg-indigo-950/30 border border-indigo-200 dark:border-indigo-800">
+                      <div className="flex items-center justify-between mb-1">
+                        <span className="font-mono text-indigo-700 dark:text-indigo-300 truncate flex-1">{s.method} {s.pattern}</span>
+                        <span className={`text-[9px] px-1.5 py-0.5 rounded-full font-bold ${
+                          s.confidence === 'high' ? 'bg-emerald-100 text-emerald-700' :
+                          s.confidence === 'medium' ? 'bg-amber-100 text-amber-700' :
+                          'bg-zinc-100 text-zinc-500'
+                        }`}>{s.confidence}</span>
+                      </div>
+                      <p className="text-[10px] text-zinc-500 mb-1.5">{s.reason}</p>
+                      <div className="flex items-center gap-1.5">
+                        <button onClick={() => acceptSuggestion(s)} className="px-2 py-0.5 bg-indigo-600 text-white rounded text-[10px] font-bold hover:bg-indigo-700">Accept</button>
+                        <button onClick={() => dismissSuggestion(s)} className="px-2 py-0.5 text-zinc-400 hover:text-zinc-600 text-[10px]">Dismiss</button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </section>
+          )}
+
           {/* Proxy Status Section */}
           <section className="mt-auto pt-4 border-t border-zinc-200 dark:border-zinc-800">
             <div className="px-2">
@@ -909,6 +1279,11 @@ export default function Home() {
                 <button onClick={() => { setSwaggerInput(''); setSwaggerResult(null); setSwaggerSelectedIds(new Set()); setIsSwaggerModalOpen(true); }} className="px-3 py-2 text-xs font-medium text-zinc-600 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800 rounded-lg flex items-center gap-1.5 transition-colors" title="Import from Swagger">
                   <FileText className="w-3.5 h-3.5" /> Swagger
                 </button>
+                {isAIEnabled && (
+                  <button onClick={() => { setNlPrompt(''); setNlResults([]); setNlStatus('idle'); setNlError(''); setIsNlModalOpen(true); }} className="px-3 py-2 text-xs font-medium text-purple-600 dark:text-purple-400 hover:bg-purple-50 dark:hover:bg-purple-950/50 rounded-lg flex items-center gap-1.5 transition-colors border border-purple-200 dark:border-purple-800" title="Create mocks with natural language">
+                    <MessageSquare className="w-3.5 h-3.5" /> AI Builder
+                  </button>
+                )}
                 <button onClick={() => setIsMockModalOpen(true)} className="px-3 py-2 text-xs font-bold text-white bg-indigo-600 hover:bg-indigo-700 rounded-lg flex items-center gap-1.5 transition-colors shadow-sm">
                   <Plus className="w-3.5 h-3.5" /> Add Rule
                 </button>
@@ -1067,7 +1442,19 @@ export default function Home() {
                             }`}>{m.method}</span>
                           </td>
                           <td className="px-4 py-3">
-                            <span className="text-xs font-mono text-zinc-700 dark:text-zinc-300 truncate block max-w-md" title={m.pattern}>{m.pattern}</span>
+                            <div className="flex flex-col gap-0.5">
+                              <div className="flex items-center gap-2">
+                                <span className="text-xs font-mono text-zinc-700 dark:text-zinc-300 truncate block max-w-md" title={m.pattern}>{m.pattern}</span>
+                                {m.mockType === 'dynamic' && (
+                                  <span className="shrink-0 text-[9px] font-bold px-1.5 py-0.5 rounded bg-purple-100 dark:bg-purple-900/40 text-purple-600 dark:text-purple-400 flex items-center gap-0.5" title="Dynamic: AI generates a fresh response on every request">
+                                    <Zap className="w-2.5 h-2.5" /> DYNAMIC
+                                  </span>
+                                )}
+                              </div>
+                              {m.mockType === 'dynamic' && m.description && (
+                                <span className="text-[10px] text-purple-500 dark:text-purple-400 truncate max-w-md" title={m.description}>{m.description}</span>
+                              )}
+                            </div>
                           </td>
                           <td className="px-4 py-3 text-center">
                             <span className="text-[10px] font-medium px-2 py-0.5 rounded-full bg-zinc-100 dark:bg-zinc-800 text-zinc-500 dark:text-zinc-400 capitalize">{getControllerName(m.pattern)}</span>
@@ -1099,10 +1486,9 @@ export default function Home() {
                               </button>
                               {isAIEnabled && (
                                 <button
-                                  onClick={() => generateAIBody(m.id)}
+                                  onClick={() => setAiTestModal({ open: true, mock: m, generatedBody: m.aiBody || '', status: m.aiBody ? 'done' : 'idle', error: '' })}
                                   className="p-1.5 hover:bg-purple-50 dark:hover:bg-purple-950/50 rounded-md text-zinc-400 hover:text-purple-600"
-                                  title={m.aiStatus === 'generating' ? 'Generating...' : 'Regenerate AI data'}
-                                  disabled={m.aiStatus === 'generating'}
+                                  title="AI Generate"
                                 >
                                   <Sparkles className={`w-3.5 h-3.5 ${m.aiStatus === 'generating' ? 'animate-pulse' : ''}`} />
                                 </button>
@@ -1211,6 +1597,29 @@ export default function Home() {
             )}
           </div>
           <div className="flex items-center gap-3">
+            {isAIEnabled && logs.length >= 3 && (
+              <>
+                <button
+                  onClick={handleAnalyzeTraffic}
+                  disabled={aiAnalysisStatus === 'analyzing'}
+                  className="px-3 py-2 text-xs font-medium text-purple-600 dark:text-purple-400 hover:bg-purple-50 dark:hover:bg-purple-950/50 rounded-lg flex items-center gap-1.5 transition-colors disabled:opacity-50"
+                  title="Analyze traffic with AI"
+                >
+                  {aiAnalysisStatus === 'analyzing' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Brain className="w-3.5 h-3.5" />}
+                  Analyze
+                </button>
+                <button
+                  onClick={handleGetSuggestions}
+                  disabled={suggestionsStatus === 'loading'}
+                  className="px-3 py-2 text-xs font-medium text-indigo-600 dark:text-indigo-400 hover:bg-indigo-50 dark:hover:bg-indigo-950/50 rounded-lg flex items-center gap-1.5 transition-colors disabled:opacity-50"
+                  title="Get mock suggestions from AI"
+                >
+                  {suggestionsStatus === 'loading' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Lightbulb className="w-3.5 h-3.5" />}
+                  Suggest
+                </button>
+                <div className="h-4 w-[1px] bg-zinc-200 dark:bg-zinc-700"></div>
+              </>
+            )}
             <button onClick={() => setLogs([])} className="text-xs text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-100 transition-colors">Clear</button>
             <div className="h-4 w-[1px] bg-zinc-200 dark:bg-zinc-700"></div>
             <button 
@@ -1281,7 +1690,19 @@ export default function Home() {
                       </span>
                     </td>
                     <td className="px-6 py-4 text-right pr-8">
-                      <span className="text-[11px] font-mono text-zinc-400">{log.duration}ms</span>
+                      <div className="flex items-center justify-end gap-1.5">
+                        {isAIEnabled && typeof log.duration === 'number' && avgDuration > 0 && log.duration > avgDuration * 2 && (
+                          <span title={`Slow: ${log.duration}ms vs avg ${Math.round(avgDuration)}ms`} className="w-4 h-4 flex items-center justify-center rounded-full bg-amber-100 dark:bg-amber-900/40">
+                            <TrendingUp className="w-2.5 h-2.5 text-amber-600 dark:text-amber-400" />
+                          </span>
+                        )}
+                        {isAIEnabled && endpointErrorCounts.get(log.url) !== undefined && (endpointErrorCounts.get(log.url) ?? 0) >= 3 && (typeof log.status === 'string' ? log.status === 'FAIL' : log.status >= 400) && (
+                          <span title={`Repeated errors on this endpoint (${endpointErrorCounts.get(log.url)})`} className="w-4 h-4 flex items-center justify-center rounded-full bg-red-100 dark:bg-red-900/40">
+                            <AlertCircle className="w-2.5 h-2.5 text-red-600 dark:text-red-400" />
+                          </span>
+                        )}
+                        <span className="text-[11px] font-mono text-zinc-400">{log.duration}ms</span>
+                      </div>
                     </td>
                   </tr>
                 ))}
@@ -1391,7 +1812,9 @@ export default function Home() {
                 pattern,
                 method: contextMenu.method || 'GET',
                 status: typeof contextMenu.status === 'number' ? contextMenu.status : 200,
-                body: existingBody
+                body: existingBody,
+                mockType: 'static',
+                description: ''
               });
               setIsMockModalOpen(true);
               setContextMenu(null);
@@ -1413,7 +1836,9 @@ export default function Home() {
                 pattern,
                 method: contextMenu.method || 'GET',
                 status: 200,
-                body: '{\n  "status": "success"\n}'
+                body: '{\n  "status": "success"\n}',
+                mockType: 'static',
+                description: ''
               });
               setIsMockModalOpen(true);
               setContextMenu(null);
@@ -1560,18 +1985,68 @@ export default function Home() {
               </div>
 
               <div>
-                <label className="text-[10px] font-bold text-zinc-400 uppercase mb-1.5 block">JSON Body</label>
+                <label className="text-[10px] font-bold text-zinc-400 uppercase mb-1.5 block">Response Type</label>
+                <div className="flex items-center gap-2 p-1 bg-zinc-100 dark:bg-zinc-800 rounded-xl">
+                  <button
+                    type="button"
+                    onClick={() => setNewMock({...newMock, mockType: 'static'})}
+                    className={`flex-1 px-3 py-2 text-xs font-semibold rounded-lg transition-all flex items-center justify-center gap-1.5 ${
+                      newMock.mockType === 'static'
+                        ? 'bg-white dark:bg-zinc-700 text-zinc-800 dark:text-zinc-100 shadow-sm'
+                        : 'text-zinc-400 hover:text-zinc-600 dark:hover:text-zinc-300'
+                    }`}
+                  >
+                    <FileText className="w-3.5 h-3.5" /> Static
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setNewMock({...newMock, mockType: 'dynamic'})}
+                    className={`flex-1 px-3 py-2 text-xs font-semibold rounded-lg transition-all flex items-center justify-center gap-1.5 ${
+                      newMock.mockType === 'dynamic'
+                        ? 'bg-purple-600 text-white shadow-sm shadow-purple-200 dark:shadow-purple-900/30'
+                        : 'text-zinc-400 hover:text-zinc-600 dark:hover:text-zinc-300'
+                    }`}
+                  >
+                    <Zap className="w-3.5 h-3.5" /> Dynamic
+                  </button>
+                </div>
+                {newMock.mockType === 'dynamic' && (
+                  <p className="text-[10px] text-purple-500 dark:text-purple-400 mt-1.5 flex items-center gap-1">
+                    <Sparkles className="w-3 h-3" /> AI generates a fresh response on every request
+                  </p>
+                )}
+              </div>
+
+              {newMock.mockType === 'dynamic' && (
+                <div>
+                  <label className="text-[10px] font-bold text-zinc-400 uppercase mb-1.5 block">API Behavior Description</label>
+                  <textarea
+                    rows={3}
+                    value={newMock.description}
+                    onChange={e => setNewMock({...newMock, description: e.target.value})}
+                    placeholder="e.g. Returns a paginated list of users with name, email, avatar, and role. Supports filtering by role (admin, user, moderator). POST creates a new user and echoes back the created object with a generated ID."
+                    className="w-full px-4 py-3 bg-purple-50 dark:bg-purple-950/30 text-purple-800 dark:text-purple-200 border border-purple-200 dark:border-purple-800 rounded-xl text-xs outline-none focus:ring-2 focus:ring-purple-500/20 focus:border-purple-500 transition-all leading-relaxed resize-y placeholder:text-purple-300 dark:placeholder:text-purple-600"
+                  />
+                  <p className="text-[10px] text-zinc-400 mt-1">Describe what this API does in plain English. The AI will use this to generate contextually accurate responses.</p>
+                </div>
+              )}
+
+              <div>
+                <label className="text-[10px] font-bold text-zinc-400 uppercase mb-1.5 block">{newMock.mockType === 'dynamic' ? 'Template JSON Body (optional — defines response shape)' : 'JSON Body'}</label>
                 <textarea 
                   rows={Math.min(20, Math.max(6, newMock.body.split('\n').length + 1))}
                   value={newMock.body}
                   onChange={e => setNewMock({...newMock, body: e.target.value})}
                   className="w-full px-4 py-3 bg-zinc-900 text-indigo-300 border border-zinc-800 rounded-xl text-xs font-mono outline-none focus:border-indigo-500/50 transition-all leading-relaxed max-h-[50vh] overflow-y-auto resize-y"
                 />
+                {newMock.mockType === 'dynamic' && (
+                  <p className="text-[10px] text-zinc-400 mt-1">Optional. Provide a JSON template to constrain the response structure. If empty, the AI infers the shape from your description.</p>
+                )}
               </div>
             </div>
 
             <div className="mt-10 flex justify-end gap-3">
-              <button onClick={() => { setIsMockModalOpen(false); setEditingMockId(null); setNewMock({ pattern: '', method: 'GET', status: 200, body: '{\n  "status": "success"\n}' }); }} className="px-5 py-2.5 text-sm font-semibold text-zinc-500 hover:text-zinc-800 dark:hover:text-zinc-200">Cancel</button>
+              <button onClick={() => { setIsMockModalOpen(false); setEditingMockId(null); setNewMock({ pattern: '', method: 'GET', status: 200, body: '{\n  "status": "success"\n}', mockType: 'static', description: '' }); }} className="px-5 py-2.5 text-sm font-semibold text-zinc-500 hover:text-zinc-800 dark:hover:text-zinc-200">Cancel</button>
               <button onClick={handleAddMock} className="px-8 py-2.5 bg-indigo-600 text-white text-sm font-bold rounded-xl hover:bg-indigo-700 shadow-xl shadow-indigo-100 dark:shadow-indigo-900/20 transition-all">{editingMockId !== null ? 'Save Changes' : 'Create Rule'}</button>
             </div>
           </div>
@@ -1692,6 +2167,324 @@ export default function Home() {
         </div>
       )}
 
+      {/* Natural Language Builder Modal */}
+      {isNlModalOpen && (
+        <div className="fixed inset-0 z-[60] flex items-center justify-center bg-zinc-900/40 dark:bg-black/60 backdrop-blur-sm px-4">
+          <div className="bg-white dark:bg-zinc-900 w-full max-w-2xl rounded-2xl shadow-2xl border border-zinc-200 dark:border-zinc-700 p-8 max-h-[90vh] flex flex-col">
+            <div className="flex items-center justify-between mb-1">
+              <div className="flex items-center gap-2">
+                <MessageSquare className="w-5 h-5 text-purple-500" />
+                <h3 className="text-xl font-bold">AI Mock Builder</h3>
+                <span className="px-1.5 py-0.5 bg-purple-100 dark:bg-purple-900/40 text-purple-600 dark:text-purple-400 text-[9px] font-bold uppercase rounded">Beta</span>
+              </div>
+              <button onClick={() => setIsNlModalOpen(false)} className="p-1 hover:bg-zinc-100 dark:hover:bg-zinc-800 rounded text-zinc-400">
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+            <p className="text-zinc-500 dark:text-zinc-400 text-sm mb-6">Describe the API mocks you need in plain English and AI will generate the rules for you.</p>
+
+            {/* Prompt input */}
+            <div className="mb-4">
+              <label className="text-[10px] font-bold text-zinc-400 uppercase mb-1.5 block">Describe your mocks</label>
+              <textarea
+                value={nlPrompt}
+                onChange={e => setNlPrompt(e.target.value)}
+                placeholder="e.g. Create a REST API for a blog with posts and comments. Include GET list, GET by ID, POST create, PUT update, and DELETE for both resources. Use realistic sample data."
+                rows={4}
+                className="w-full px-4 py-3 bg-zinc-50 dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded-xl text-sm outline-none focus:ring-2 focus:ring-purple-500/20 focus:border-purple-500 transition-all resize-none"
+                onKeyDown={e => { if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) handleNlGenerate(); }}
+              />
+              <p className="text-[10px] text-zinc-400 mt-1">Press ⌘+Enter to generate</p>
+            </div>
+
+            {/* Generate button */}
+            <div className="flex items-center gap-3 mb-4">
+              <button
+                onClick={handleNlGenerate}
+                disabled={nlStatus === 'generating' || !nlPrompt.trim()}
+                className="px-5 py-2.5 bg-purple-600 text-white text-sm font-bold rounded-xl hover:bg-purple-700 shadow-lg shadow-purple-100 dark:shadow-purple-900/20 transition-all disabled:opacity-60 disabled:cursor-not-allowed flex items-center gap-2"
+              >
+                {nlStatus === 'generating' ? (
+                  <><Loader2 className="w-4 h-4 animate-spin" /> Generating...</>
+                ) : (
+                  <><Brain className="w-4 h-4" /> Generate Mocks</>
+                )}
+              </button>
+              {nlStatus === 'done' && <span className="text-xs text-green-600 dark:text-green-400 flex items-center gap-1"><CheckCircle2 className="w-3.5 h-3.5" /> {nlResults.length} rule{nlResults.length !== 1 ? 's' : ''} generated</span>}
+            </div>
+
+            {/* Error */}
+            {nlStatus === 'error' && nlError && (
+              <div className="flex items-start gap-2 p-3 bg-red-50 dark:bg-red-950/40 border border-red-200 dark:border-red-800 rounded-lg text-sm text-red-700 dark:text-red-400 mb-4">
+                <AlertCircle className="w-4 h-4 mt-0.5 flex-shrink-0" />
+                {nlError}
+              </div>
+            )}
+
+            {/* Results */}
+            {nlResults.length > 0 && (
+              <div className="flex-1 overflow-hidden flex flex-col mb-4">
+                <div className="flex items-center justify-between mb-2">
+                  <label className="text-[10px] font-bold text-purple-500 uppercase">Generated Rules</label>
+                  <button
+                    onClick={() => {
+                      if (nlSelectedIds.size === nlResults.length) setNlSelectedIds(new Set());
+                      else setNlSelectedIds(new Set(nlResults.map((_, i) => i)));
+                    }}
+                    className="text-[10px] text-zinc-400 hover:text-zinc-600 dark:hover:text-zinc-300 transition-colors"
+                  >
+                    {nlSelectedIds.size === nlResults.length ? 'Deselect All' : 'Select All'}
+                  </button>
+                </div>
+                <div className="flex-1 overflow-y-auto space-y-2 max-h-[300px]">
+                  {nlResults.map((rule, i) => {
+                    const isExpanded = nlExpandedRule === i;
+                    return (
+                    <div key={i} className={`rounded-xl border transition-all ${
+                      nlSelectedIds.has(i)
+                        ? 'border-purple-300 dark:border-purple-700 bg-purple-50/50 dark:bg-purple-950/20'
+                        : 'border-zinc-200 dark:border-zinc-700 bg-zinc-50 dark:bg-zinc-800/50 opacity-60'
+                    }`}>
+                      <div className="flex items-start gap-3 p-3 cursor-pointer" onClick={() => {
+                        const next = new Set(nlSelectedIds);
+                        if (next.has(i)) next.delete(i); else next.add(i);
+                        setNlSelectedIds(next);
+                      }}>
+                        <input
+                          type="checkbox"
+                          checked={nlSelectedIds.has(i)}
+                          onChange={() => {
+                            const next = new Set(nlSelectedIds);
+                            if (next.has(i)) next.delete(i); else next.add(i);
+                            setNlSelectedIds(next);
+                          }}
+                          onClick={e => e.stopPropagation()}
+                          className="mt-1 accent-purple-600"
+                        />
+                        <div className="flex-1 min-w-0">
+                          <div className="flex items-center gap-2 mb-1">
+                            <span className={`text-[10px] font-black px-1.5 py-0.5 rounded ${
+                              rule.method === 'GET' ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-400'
+                              : rule.method === 'POST' ? 'bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-400'
+                              : rule.method === 'PUT' ? 'bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-400'
+                              : rule.method === 'DELETE' ? 'bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-400'
+                              : 'bg-zinc-100 text-zinc-500'
+                            }`}>{rule.method}</span>
+                            <span className="text-xs font-mono text-zinc-700 dark:text-zinc-300 truncate">{rule.pattern}</span>
+                            <span className="text-[10px] text-zinc-400 ml-auto">→ {rule.status}</span>
+                          </div>
+                          {!isExpanded && (
+                            <pre className="text-[10px] font-mono text-zinc-500 dark:text-zinc-400 truncate max-w-full">
+                              {(() => { try { return JSON.stringify(JSON.parse(rule.body), null, 0).slice(0, 120); } catch { return rule.body.slice(0, 120); } })()}
+                            </pre>
+                          )}
+                        </div>
+                        <button
+                          onClick={e => { e.stopPropagation(); setNlExpandedRule(isExpanded ? null : i); }}
+                          className="p-1 hover:bg-zinc-200 dark:hover:bg-zinc-700 rounded text-zinc-400 hover:text-zinc-600 dark:hover:text-zinc-300 transition-colors shrink-0"
+                          title={isExpanded ? 'Collapse' : 'Edit JSON body'}
+                        >
+                          <Pencil className="w-3.5 h-3.5" />
+                        </button>
+                      </div>
+                      {isExpanded && (
+                        <div className="px-3 pb-3 pt-0">
+                          <textarea
+                            value={(() => { try { return JSON.stringify(JSON.parse(rule.body), null, 2); } catch { return rule.body; } })()}
+                            onChange={e => {
+                              setNlResults(prev => prev.map((r, idx) => idx === i ? { ...r, body: e.target.value } : r));
+                            }}
+                            spellCheck={false}
+                            className="w-full px-3 py-2 bg-zinc-900 text-green-300 border border-zinc-700 rounded-lg text-[11px] font-mono leading-relaxed outline-none focus:ring-2 focus:ring-purple-500/30 focus:border-purple-600 transition-all resize-y min-h-[100px] max-h-[250px]"
+                            rows={6}
+                          />
+                          {(() => { try { JSON.parse(rule.body); return null; } catch { return <p className="text-[10px] text-red-500 mt-1">Invalid JSON</p>; } })()}
+                        </div>
+                      )}
+                    </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+
+            {/* Footer */}
+            <div className="flex justify-end gap-3 pt-4 border-t border-zinc-100 dark:border-zinc-800 mt-auto">
+              <button onClick={() => setIsNlModalOpen(false)} className="px-5 py-2.5 text-sm font-semibold text-zinc-500 hover:text-zinc-800 dark:hover:text-zinc-200">Cancel</button>
+              <button
+                onClick={handleNlImport}
+                disabled={nlSelectedIds.size === 0 || nlResults.length === 0}
+                className="px-8 py-2.5 bg-indigo-600 text-white text-sm font-bold rounded-xl hover:bg-indigo-700 shadow-xl shadow-indigo-100 dark:shadow-indigo-900/20 transition-all disabled:opacity-40 disabled:cursor-not-allowed flex items-center gap-2"
+              >
+                <ArrowRight className="w-4 h-4" /> Import {nlSelectedIds.size} Rule{nlSelectedIds.size !== 1 ? 's' : ''}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* AI Test Modal */}
+      {aiTestModal.open && aiTestModal.mock && (
+        <div className="fixed inset-0 z-[60] flex items-center justify-center bg-zinc-900/40 dark:bg-black/60 backdrop-blur-sm px-4">
+          <div className="bg-white dark:bg-zinc-900 w-full max-w-2xl rounded-2xl shadow-2xl border border-zinc-200 dark:border-zinc-700 p-8 max-h-[90vh] flex flex-col">
+            <div className="flex items-center justify-between mb-1">
+              <div className="flex items-center gap-2">
+                <Sparkles className="w-5 h-5 text-purple-500" />
+                <h3 className="text-xl font-bold">AI Mock Generator</h3>
+                <span className="px-1.5 py-0.5 bg-purple-100 dark:bg-purple-900/40 text-purple-600 dark:text-purple-400 text-[9px] font-bold uppercase rounded">Beta</span>
+              </div>
+              <button onClick={() => setAiTestModal({ open: false, mock: null, generatedBody: '', status: 'idle', error: '' })} className="p-1 hover:bg-zinc-100 dark:hover:bg-zinc-800 rounded text-zinc-400">
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+            <p className="text-zinc-500 dark:text-zinc-400 text-sm mb-6">Generate realistic AI-powered response data for this mock rule.</p>
+
+            {/* Mock rule info */}
+            <div className="flex items-center gap-3 p-3 bg-zinc-50 dark:bg-zinc-800/50 border border-zinc-200 dark:border-zinc-700 rounded-xl mb-4">
+              <span className={`text-[10px] font-black px-2 py-0.5 rounded ${
+                aiTestModal.mock.method === 'GET' ? 'bg-emerald-100 text-emerald-700'
+                : aiTestModal.mock.method === 'POST' ? 'bg-blue-100 text-blue-700'
+                : aiTestModal.mock.method === 'PUT' ? 'bg-amber-100 text-amber-700'
+                : aiTestModal.mock.method === 'DELETE' ? 'bg-red-100 text-red-700'
+                : 'bg-zinc-100 text-zinc-500'
+              }`}>{aiTestModal.mock.method}</span>
+              <span className="text-sm font-mono text-zinc-700 dark:text-zinc-300 truncate flex-1">{aiTestModal.mock.pattern}</span>
+              <span className="text-xs text-zinc-400">Status {aiTestModal.mock.status}</span>
+            </div>
+
+            {/* Template Body */}
+            <div className="mb-4">
+              <label className="text-[10px] font-bold text-zinc-400 uppercase mb-1.5 block">Template Body</label>
+              <pre className="w-full px-4 py-3 bg-zinc-900 text-zinc-400 border border-zinc-800 rounded-xl text-xs font-mono leading-relaxed max-h-[140px] overflow-y-auto whitespace-pre-wrap">{(() => {
+                try { return JSON.stringify(JSON.parse(aiTestModal.mock.body), null, 2); } catch { return aiTestModal.mock.body; }
+              })()}</pre>
+            </div>
+
+            {/* Generate button */}
+            <div className="flex items-center gap-3 mb-4">
+              <button
+                onClick={async () => {
+                  setAiTestModal(prev => ({ ...prev, status: 'generating', error: '' }));
+                  try {
+                    const response = await originalFetch('http://localhost:8888/api/ai/generate', {
+                      method: 'POST',
+                      headers: {
+                        'Content-Type': 'application/json',
+                        ...(githubPat ? { 'X-GitHub-Token': githubPat } : {}),
+                      },
+                      body: JSON.stringify({
+                        pattern: aiTestModal.mock!.pattern,
+                        method: aiTestModal.mock!.method,
+                        status: aiTestModal.mock!.status,
+                        body: aiTestModal.mock!.body,
+                        model: aiModel,
+                      }),
+                    });
+                    if (!response.ok) {
+                      const errorData = await response.json();
+                      throw new Error(errorData.error || `HTTP ${response.status}`);
+                    }
+                    const data = await response.json();
+                    setAiTestModal(prev => ({ ...prev, generatedBody: data.aiBody, status: 'done', error: '' }));
+                  } catch (err) {
+                    setAiTestModal(prev => ({ ...prev, status: 'error', error: err instanceof Error ? err.message : String(err) }));
+                  }
+                }}
+                disabled={aiTestModal.status === 'generating'}
+                className="px-5 py-2.5 bg-purple-600 text-white text-sm font-bold rounded-xl hover:bg-purple-700 shadow-lg shadow-purple-100 dark:shadow-purple-900/20 transition-all disabled:opacity-60 disabled:cursor-not-allowed flex items-center gap-2"
+              >
+                {aiTestModal.status === 'generating' ? (
+                  <><Loader2 className="w-4 h-4 animate-spin" /> Generating...</>
+                ) : aiTestModal.generatedBody ? (
+                  <><RefreshCw className="w-4 h-4" /> Regenerate</>
+                ) : (
+                  <><Sparkles className="w-4 h-4" /> Generate</>
+                )}
+              </button>
+              {aiTestModal.status === 'done' && <span className="text-xs text-green-600 dark:text-green-400 flex items-center gap-1"><CheckCircle2 className="w-3.5 h-3.5" /> Generated successfully</span>}
+            </div>
+
+            {/* Error */}
+            {aiTestModal.status === 'error' && aiTestModal.error && (
+              <div className="flex items-start gap-2 p-3 bg-red-50 dark:bg-red-950/40 border border-red-200 dark:border-red-800 rounded-lg text-sm text-red-700 dark:text-red-400 mb-4">
+                <AlertCircle className="w-4 h-4 mt-0.5 flex-shrink-0" />
+                {aiTestModal.error}
+              </div>
+            )}
+
+            {/* Generated Body */}
+            {aiTestModal.generatedBody && (
+              <div className="mb-4 flex-1 overflow-hidden flex flex-col">
+                <div className="flex items-center justify-between mb-1.5">
+                  <div className="flex items-center gap-3">
+                    <label className="text-[10px] font-bold text-purple-500 uppercase">AI Generated Body</label>
+                    <button
+                      onClick={() => setShowDiffView(!showDiffView)}
+                      className={`text-[10px] font-medium px-2 py-0.5 rounded-full flex items-center gap-1 transition-colors ${
+                        showDiffView ? 'bg-purple-100 dark:bg-purple-900/40 text-purple-600 dark:text-purple-400' : 'text-zinc-400 hover:text-zinc-600 dark:hover:text-zinc-300'
+                      }`}
+                    >
+                      <ArrowRight className="w-2.5 h-2.5" /> {showDiffView ? 'Hide Diff' : 'Show Diff'}
+                    </button>
+                  </div>
+                  <button
+                    onClick={() => {
+                      navigator.clipboard.writeText(
+                        (() => { try { return JSON.stringify(JSON.parse(aiTestModal.generatedBody), null, 2); } catch { return aiTestModal.generatedBody; } })()
+                      );
+                    }}
+                    className="text-[10px] text-zinc-400 hover:text-zinc-600 dark:hover:text-zinc-300 flex items-center gap-1 transition-colors"
+                  >
+                    <Copy className="w-3 h-3" /> Copy
+                  </button>
+                </div>
+                {showDiffView ? (
+                  <div className="grid grid-cols-2 gap-2 flex-1 overflow-hidden">
+                    <div className="flex flex-col overflow-hidden">
+                      <span className="text-[9px] font-bold text-zinc-500 uppercase mb-1">Template</span>
+                      <pre className="w-full px-3 py-2 bg-zinc-900 text-zinc-400 border border-zinc-800 rounded-lg text-[10px] font-mono leading-relaxed max-h-[200px] overflow-y-auto whitespace-pre-wrap flex-1">{(() => {
+                        try { return JSON.stringify(JSON.parse(aiTestModal.mock!.body), null, 2); } catch { return aiTestModal.mock!.body; }
+                      })()}</pre>
+                    </div>
+                    <div className="flex flex-col overflow-hidden">
+                      <span className="text-[9px] font-bold text-purple-500 uppercase mb-1">AI Generated</span>
+                      <pre className="w-full px-3 py-2 bg-zinc-900 text-green-300 border border-purple-800/50 rounded-lg text-[10px] font-mono leading-relaxed max-h-[200px] overflow-y-auto whitespace-pre-wrap flex-1">{(() => {
+                        try { return JSON.stringify(JSON.parse(aiTestModal.generatedBody), null, 2); } catch { return aiTestModal.generatedBody; }
+                      })()}</pre>
+                    </div>
+                  </div>
+                ) : (
+                  <pre className="w-full px-4 py-3 bg-zinc-900 text-green-300 border border-purple-800/50 rounded-xl text-xs font-mono leading-relaxed max-h-[240px] overflow-y-auto whitespace-pre-wrap flex-1">{(() => {
+                    try { return JSON.stringify(JSON.parse(aiTestModal.generatedBody), null, 2); } catch { return aiTestModal.generatedBody; }
+                  })()}</pre>
+                )}
+              </div>
+            )}
+
+            {/* Footer */}
+            <div className="flex justify-end gap-3 pt-4 border-t border-zinc-100 dark:border-zinc-800 mt-auto">
+              <button onClick={() => setAiTestModal({ open: false, mock: null, generatedBody: '', status: 'idle', error: '' })} className="px-5 py-2.5 text-sm font-semibold text-zinc-500 hover:text-zinc-800 dark:hover:text-zinc-200">Cancel</button>
+              <button
+                onClick={() => {
+                  if (aiTestModal.mock && aiTestModal.generatedBody) {
+                    setMocks(prev => prev.map(m =>
+                      m.id === aiTestModal.mock!.id
+                        ? { ...m, aiBody: aiTestModal.generatedBody, aiStatus: 'done' as const, aiError: undefined }
+                        : m
+                    ));
+                    setAiTestModal({ open: false, mock: null, generatedBody: '', status: 'idle', error: '' });
+                  }
+                }}
+                disabled={!aiTestModal.generatedBody}
+                className="px-8 py-2.5 bg-indigo-600 text-white text-sm font-bold rounded-xl hover:bg-indigo-700 shadow-xl shadow-indigo-100 dark:shadow-indigo-900/20 transition-all disabled:opacity-40 disabled:cursor-not-allowed flex items-center gap-2"
+              >
+                <Check className="w-4 h-4" /> Apply to Mock
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Settings Modal */}
       {isSettingsModalOpen && (
         <div className="fixed inset-0 z-[60] flex items-center justify-center bg-zinc-900/40 dark:bg-black/60 backdrop-blur-sm px-4">
@@ -1773,6 +2566,33 @@ export default function Home() {
                       <option value="gpt-4o-mini">GPT-4o Mini (faster)</option>
                       <option value="gpt-4o">GPT-4o (higher quality)</option>
                     </select>
+                  </div>
+
+                  {/* Custom System Prompt */}
+                  <div>
+                    <label className="text-[10px] font-bold text-zinc-400 uppercase mb-1.5 block">
+                      Custom System Prompt
+                    </label>
+                    <textarea
+                      value={customSystemPrompt}
+                      onChange={e => setCustomSystemPrompt(e.target.value)}
+                      placeholder="Override the default AI system prompt. Leave empty to use the built-in prompt for generating realistic mock data."
+                      rows={3}
+                      className="w-full px-3 py-2 bg-zinc-50 dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded-lg text-xs outline-none focus:ring-2 focus:ring-purple-500/20 focus:border-purple-500 transition-all resize-none"
+                    />
+                    <div className="flex items-center justify-between mt-1">
+                      <p className="text-[10px] text-zinc-400">
+                        {customSystemPrompt ? 'Using custom prompt' : 'Using default prompt'}
+                      </p>
+                      {customSystemPrompt && (
+                        <button
+                          onClick={() => setCustomSystemPrompt('')}
+                          className="text-[10px] text-purple-500 hover:text-purple-700 dark:hover:text-purple-300 transition-colors"
+                        >
+                          Reset to Default
+                        </button>
+                      )}
+                    </div>
                   </div>
 
                   {/* Status indicator */}

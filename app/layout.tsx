@@ -4,6 +4,9 @@ import "./globals.css";
 export const metadata: Metadata = {
   title: "API Labs",
   description: "Intercept and log HTTP calls with mock support",
+  icons: {
+    icon: "/icon.svg",
+  },
 };
 
 export default function RootLayout({

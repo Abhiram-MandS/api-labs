@@ -1,3 +1,5 @@
+const dotenvResult = require('dotenv').config();
+require('dotenv-expand').expand(dotenvResult);
 const express = require('express');
 const http = require('http');
 const httpProxy = require('http-proxy');
@@ -7,7 +9,11 @@ const url = require('url');
 const net = require('net');
 const tls = require('tls');
 const crypto = require('crypto');
-const { generateAIMockBody } = require('./utils/ai-generate');
+const { generateAIMockBody, generateMockFromNaturalLanguage, analyzeTrafficLogs, suggestMockRules, generateDynamicResponse, aiQueue } = require('./utils/ai-generate');
+
+// --- Server-side traffic log buffer for AI analysis ---
+const trafficLogBuffer = [];
+const MAX_TRAFFIC_LOG_BUFFER = 200;
 
 const app = express();
 const PORT = process.env.PROXY_PORT || 8888;
@@ -66,10 +72,42 @@ let connectedClients = 0;
 // --- Server-side Mock Rules ---
 let mockRules = [];
 let isAIEnabled = false;
+let aiModel = 'gpt-4o-mini';
 
 function getEffectiveBody(mock) {
   if (isAIEnabled && mock.aiBody) return mock.aiBody;
   return mock.body;
+}
+
+function isDynamicMock(mock) {
+  return mock.mockType === 'dynamic';
+}
+
+// Generate a dynamic response body via LLM. Returns the body string.
+// Falls back to static body on error.
+async function getDynamicBody(mock, { requestBody, requestHeaders } = {}) {
+  const token = process.env.GITHUB_TOKEN;
+  if (!token) {
+    console.log('⚠️ Dynamic mock: no GITHUB_TOKEN, falling back to static body');
+    return getEffectiveBody(mock);
+  }
+  try {
+    const body = await aiQueue.enqueue(() => generateDynamicResponse({
+      pattern: mock.pattern,
+      method: mock.method,
+      status: mock.status,
+      body: mock.body,
+      description: mock.description || '',
+      requestBody,
+      requestHeaders,
+      model: aiModel,
+    }, token));
+    console.log(`🤖 Dynamic mock generated for ${mock.method} ${mock.pattern}`);
+    return body;
+  } catch (err) {
+    console.error(`❌ Dynamic mock generation failed for ${mock.pattern}:`, err.message);
+    return getEffectiveBody(mock);
+  }
 }
 
 function findMockMatch(requestUrl, method) {
@@ -101,6 +139,10 @@ io.on('connection', (socket) => {
       isAIEnabled = settings.isAIEnabled;
       console.log(`⚙️ Settings updated: AI ${isAIEnabled ? 'enabled' : 'disabled'}`);
     }
+    if (typeof settings.aiModel === 'string') {
+      aiModel = settings.aiModel;
+      console.log(`⚙️ Settings updated: AI model → ${aiModel}`);
+    }
   });
 
   socket.on('disconnect', () => {
@@ -111,6 +153,9 @@ io.on('connection', (socket) => {
 
 function emitLog(logData) {
   io.emit('proxy-log', logData);
+  // Buffer log for AI analysis
+  trafficLogBuffer.unshift(logData);
+  if (trafficLogBuffer.length > MAX_TRAFFIC_LOG_BUFFER) trafficLogBuffer.length = MAX_TRAFFIC_LOG_BUFFER;
 }
 
 // HTTPS CONNECT support — with mock interception
@@ -291,7 +336,7 @@ app.delete('/__mocks/:id', (req, res) => {
 // --- Mock Endpoint: Java/backend apps call this directly ---
 // Any request to /__proxy-mock/** will be matched against mock rules
 // Spring Boot just overrides external URLs to: http://localhost:8888/__proxy-mock/validate
-app.all('/__proxy-mock/*', (req, res) => {
+app.all('/__proxy-mock/*', async (req, res) => {
   const startTime = Date.now();
   const mockPath = req.url.replace('/__proxy-mock', '');
   const requestUrl = req.url;
@@ -307,8 +352,15 @@ app.all('/__proxy-mock/*', (req, res) => {
   });
   
   if (mockMatch) {
+    // For dynamic mocks, generate a fresh response via LLM
+    let effectiveBody;
+    if (isDynamicMock(mockMatch)) {
+      effectiveBody = await getDynamicBody(mockMatch, { requestBody: req.body, requestHeaders: req.headers });
+    } else {
+      effectiveBody = getEffectiveBody(mockMatch);
+    }
+
     const duration = Date.now() - startTime;
-    const effectiveBody = getEffectiveBody(mockMatch);
     let mockBody;
     try {
       mockBody = JSON.parse(effectiveBody);
@@ -322,19 +374,20 @@ app.all('/__proxy-mock/*', (req, res) => {
       method: req.method,
       status: mockMatch.status,
       duration,
-      type: 'Mock',
+      type: isDynamicMock(mockMatch) ? 'Dynamic Mock' : 'Mock',
       body: mockBody,
       timestamp: new Date().toLocaleTimeString(),
       isManaged: true,
       source: 'proxy'
     };
 
-    console.log(`🎭 ${req.method} ${mockPath} → Mock ${mockMatch.status} (${duration}ms)`);
+    console.log(`🎭 ${req.method} ${mockPath} → ${isDynamicMock(mockMatch) ? 'Dynamic ' : ''}Mock ${mockMatch.status} (${duration}ms)`);
     emitLog(logEntry);
 
     res.writeHead(mockMatch.status, {
       'Content-Type': 'application/json',
-      'X-Mock-By': 'HTTPIntercept-Proxy'
+      'X-Mock-By': 'HTTPIntercept-Proxy',
+      'X-Mock-Type': isDynamicMock(mockMatch) ? 'dynamic' : 'static'
     });
     return res.end(typeof effectiveBody === 'string' ? effectiveBody : JSON.stringify(effectiveBody));
   }
@@ -369,16 +422,16 @@ app.post('/api/ai/generate', async (req, res) => {
   }
 
   try {
-    const aiBody = await generateAIMockBody(
-      { pattern, method: method || 'GET', status: status || 200, body, model },
+    const aiBody = await aiQueue.enqueue(() => generateAIMockBody(
+      { pattern, method: method || 'GET', status: status || 200, body, model, customSystemPrompt: req.body.customSystemPrompt },
       token
-    );
+    ));
     res.json({ aiBody });
   } catch (err) {
     console.error('AI generation error:', err.message);
 
     if (err.status === 401) {
-      return res.status(401).json({ error: 'Invalid GitHub token' });
+      return res.status(401).json({ error: 'Invalid or insufficient GitHub token. Ensure the token has the "models" permission.' });
     }
     if (err.status === 429) {
       return res.status(429).json({ error: 'Rate limit exceeded. Try again later.' });
@@ -388,7 +441,117 @@ app.post('/api/ai/generate', async (req, res) => {
   }
 });
 
-app.use((req, res) => {
+// --- Dynamic Mock Response (called per-request for dynamic mock rules) ---
+app.post('/api/ai/dynamic-mock', async (req, res) => {
+  const { pattern, method, status, body, description, requestBody, requestHeaders, model } = req.body;
+
+  const token = req.headers['x-github-token'] || process.env.GITHUB_TOKEN;
+  if (!token) {
+    return res.status(401).json({
+      error: 'No GitHub token configured',
+      hint: 'Set GITHUB_TOKEN environment variable or configure in Settings'
+    });
+  }
+
+  if (!pattern) {
+    return res.status(400).json({ error: 'pattern is required' });
+  }
+
+  try {
+    const dynamicBody = await aiQueue.enqueue(() => generateDynamicResponse(
+      { pattern, method: method || 'GET', status: status || 200, body: body || '', description: description || '', requestBody, requestHeaders, model: model || aiModel },
+      token
+    ));
+    console.log(`🤖 Dynamic mock API: ${method} ${pattern} → generated`);
+    res.json({ body: dynamicBody });
+  } catch (err) {
+    console.error('Dynamic mock generation error:', err.message);
+    if (err.status === 401) return res.status(401).json({ error: 'Invalid or insufficient GitHub token.' });
+    if (err.status === 429) return res.status(429).json({ error: 'Rate limit exceeded. Try again later.' });
+    res.status(500).json({ error: err.message || 'Dynamic mock generation failed' });
+  }
+});
+
+// --- Natural Language Mock Builder ---
+app.post('/api/ai/natural-language', async (req, res) => {
+  const { prompt, model } = req.body;
+  const token = req.headers['x-github-token'] || process.env.GITHUB_TOKEN;
+
+  if (!token) {
+    return res.status(401).json({ error: 'No GitHub token configured', hint: 'Set GITHUB_TOKEN environment variable or configure in Settings' });
+  }
+  if (!prompt) {
+    return res.status(400).json({ error: 'prompt is required' });
+  }
+
+  try {
+    const rules = await aiQueue.enqueue(() => generateMockFromNaturalLanguage({ prompt, model }, token));
+    console.log(`🗣️ NL mock builder: "${prompt.slice(0, 50)}..." → ${rules.length} rule(s)`);
+    res.json({ rules });
+  } catch (err) {
+    console.error('NL mock builder error:', err.message);
+    if (err.status === 401) return res.status(401).json({ error: 'Invalid or insufficient GitHub token.' });
+    if (err.status === 429) return res.status(429).json({ error: 'Rate limit exceeded. Try again later.' });
+    res.status(500).json({ error: err.message || 'Natural language generation failed' });
+  }
+});
+
+// --- AI Traffic Analysis ---
+app.post('/api/ai/analyze', async (req, res) => {
+  const { logs: clientLogs, model } = req.body;
+  const token = req.headers['x-github-token'] || process.env.GITHUB_TOKEN;
+
+  if (!token) {
+    return res.status(401).json({ error: 'No GitHub token configured', hint: 'Set GITHUB_TOKEN environment variable or configure in Settings' });
+  }
+
+  // Merge client-sent logs with server-buffered logs, deduplicate by id
+  const allLogs = clientLogs || [];
+  const serverLogs = trafficLogBuffer;
+  const seen = new Set(allLogs.map(l => l.id));
+  const merged = [...allLogs, ...serverLogs.filter(l => !seen.has(l.id))];
+
+  if (merged.length === 0) {
+    return res.status(400).json({ error: 'No traffic logs to analyze' });
+  }
+
+  try {
+    const analysis = await aiQueue.enqueue(() => analyzeTrafficLogs({ logs: merged, model }, token));
+    console.log(`🔍 AI analysis: ${analysis.insights?.length || 0} insights generated`);
+    res.json(analysis);
+  } catch (err) {
+    console.error('AI analysis error:', err.message);
+    if (err.status === 401) return res.status(401).json({ error: 'Invalid or insufficient GitHub token.' });
+    if (err.status === 429) return res.status(429).json({ error: 'Rate limit exceeded. Try again later.' });
+    res.status(500).json({ error: err.message || 'Traffic analysis failed' });
+  }
+});
+
+// --- Auto Mock Suggestion ---
+app.post('/api/ai/suggest-mocks', async (req, res) => {
+  const { endpointStats, model } = req.body;
+  const token = req.headers['x-github-token'] || process.env.GITHUB_TOKEN;
+
+  if (!token) {
+    return res.status(401).json({ error: 'No GitHub token configured', hint: 'Set GITHUB_TOKEN environment variable or configure in Settings' });
+  }
+  if (!endpointStats || !Array.isArray(endpointStats) || endpointStats.length === 0) {
+    return res.status(400).json({ error: 'endpointStats array is required' });
+  }
+
+  try {
+    const suggestions = await aiQueue.enqueue(() => suggestMockRules({ endpointStats, model }, token));
+    console.log(`💡 Mock suggestions: ${suggestions.length} suggestion(s)`);
+    res.json({ suggestions });
+  } catch (err) {
+    console.error('Mock suggestion error:', err.message);
+    if (err.status === 401) return res.status(401).json({ error: 'Invalid or insufficient GitHub token.' });
+    if (err.status === 429) return res.status(429).json({ error: 'Rate limit exceeded. Try again later.' });
+    res.status(500).json({ error: err.message || 'Mock suggestion failed' });
+  }
+});
+
+app.use(async (req, res) => {
   const startTime = Date.now();
   const targetUrl = req.url;
   
@@ -415,8 +578,15 @@ app.use((req, res) => {
   // --- Check for mock match (HTTP) ---
   const mockMatch = findMockMatch(fullUrl, req.method);
   if (mockMatch) {
+    // For dynamic mocks, generate a fresh response via LLM
+    let effectiveBody;
+    if (isDynamicMock(mockMatch)) {
+      effectiveBody = await getDynamicBody(mockMatch, { requestBody: req.body, requestHeaders: req.headers });
+    } else {
+      effectiveBody = getEffectiveBody(mockMatch);
+    }
+
     const duration = Date.now() - startTime;
-    const effectiveBody = getEffectiveBody(mockMatch);
     let mockBody;
     try {
       mockBody = JSON.parse(effectiveBody);
@@ -430,19 +600,20 @@ app.use((req, res) => {
       method: req.method,
       status: mockMatch.status,
       duration,
-      type: 'Mock',
+      type: isDynamicMock(mockMatch) ? 'Dynamic Mock' : 'Mock',
       body: mockBody,
       timestamp: new Date().toLocaleTimeString(),
       isManaged: true,
       source: 'proxy'
     };
 
-    console.log(`🎭 ${req.method} ${fullUrl} → Mock ${mockMatch.status} (${duration}ms)`);
+    console.log(`🎭 ${req.method} ${fullUrl} → ${isDynamicMock(mockMatch) ? 'Dynamic ' : ''}Mock ${mockMatch.status} (${duration}ms)`);
     emitLog(logEntry);
 
     res.writeHead(mockMatch.status, {
       'Content-Type': 'application/json',
-      'X-Mock-By': 'HTTPIntercept-Proxy'
+      'X-Mock-By': 'HTTPIntercept-Proxy',
+      'X-Mock-Type': isDynamicMock(mockMatch) ? 'dynamic' : 'static'
     });
     return res.end(typeof effectiveBody === 'string' ? effectiveBody : JSON.stringify(effectiveBody));
   }
